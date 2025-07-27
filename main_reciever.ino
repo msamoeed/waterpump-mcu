@@ -303,7 +303,7 @@
  #define ROOF_TANK_UPPER_THRESHOLD 80.0
  
  // Timing constants
- #define TOTAL_MODES 9
+ #define TOTAL_MODES 8
  #define MENU_ITEMS_VISIBLE 5
  #define CONNECTION_TIMEOUT 15000
  #define DISPLAY_UPDATE_INTERVAL 50
@@ -327,13 +327,6 @@
  // Command checking variables
  unsigned long lastCommandCheck = 0;
  const unsigned long COMMAND_CHECK_INTERVAL = 5000;  // Check every 5 seconds
- 
- // OTA Update variables
- AsyncWebServer otaServer(8080);
- bool otaUpdateInProgress = false;
- unsigned long otaStartTime = 0;
- String otaStatus = "";
- float otaProgress = 0.0;
  
  // ========================================
  // ENCODER INTERRUPT
@@ -1100,18 +1093,6 @@
        showMessageWithAutoReturn("BUZZER MUTED");
      }
      currentView = -1;
-   } else if (currentView == 7) {
-     // OTA Update view
-     if (otaUpdateInProgress) {
-       showMessageWithAutoReturn("OTA IN PROGRESS");
-     } else {
-       char message[50];
-       sprintf(message, "OTA: %s:8080", WiFi.localIP().toString().c_str());
-       showMessageNonBlocking(message);
-       delay(3000);
-       showMessageWithAutoReturn("ACCESS VIA WEB");
-     }
-     currentView = -1;
    } else {
      currentView = -1;
    }
@@ -1261,13 +1242,6 @@
        case 7: 
          displaySystemInfo(); 
          break;
-       case 8: 
-         if (otaUpdateInProgress) {
-           displayOTAStatus();
-         } else {
-           displaySystemInfo();
-         }
-         break;
      }
      
      forceDisplayUpdate = false;
@@ -1291,8 +1265,7 @@
      "5. Pump Control",
      "6. Power Usage",
      "7. Buzzer Settings",
-     "8. System Info",
-     "9. OTA Update"
+     "8. System Info"
    };
    
    int startIdx = menuScrollOffset;
@@ -1674,9 +1647,7 @@
    u8g2.drawStr(5, 65, buffer);
    
    u8g2.setFont(u8g2_font_5x8_tf);
-   sprintf(buffer, "OTA: %s:8080", WiFi.localIP().toString().c_str());
-   u8g2.drawStr(5, 78, buffer);
-   
+   u8g2.drawStr(5, 78, "Press for menu");
    u8g2.sendBuffer();
  }
  
@@ -1951,9 +1922,6 @@
    // Setup RGB LED
    setupRGBLED();
    
-   // Setup OTA update server
-   setupOTA();
-   
    // Setup encoder interrupt
    lastClkState = digitalRead(ENCODER_CLK);
    attachInterrupt(digitalPinToInterrupt(ENCODER_CLK), updateEncoder, CHANGE);
@@ -2158,108 +2126,4 @@ void processPumpCommand(const String& commandJson) {
     manualPumpControl = true;
     showMessageWithAutoReturn("API: MANUAL MODE");
   }
-}
-
-// ========================================
-// OTA UPDATE FUNCTIONS
-// ========================================
-void setupOTA() {
-  // Setup OTA server
-  AsyncElegantOTA.begin(&otaServer);
-  
-  // Add custom OTA status endpoint
-  otaServer.on("/ota/status", HTTP_GET, [](AsyncWebServerRequest *request) {
-    DynamicJsonDocument doc(512);
-    doc["ota_active"] = otaUpdateInProgress;
-    doc["progress"] = otaProgress;
-    doc["status"] = otaStatus;
-    doc["uptime"] = millis();
-    doc["free_heap"] = ESP.getFreeHeap();
-    doc["firmware_version"] = "1.0.0";
-    
-    String response;
-    serializeJson(doc, response);
-    request->send(200, "application/json", response);
-  });
-  
-  // Add OTA start endpoint
-  otaServer.on("/ota/start", HTTP_POST, [](AsyncWebServerRequest *request) {
-    otaUpdateInProgress = true;
-    otaStartTime = millis();
-    otaStatus = "OTA update started";
-    otaProgress = 0.0;
-    
-    showMessageNonBlocking("OTA UPDATE STARTED");
-    playBeepNonBlocking(200);
-    
-    request->send(200, "application/json", "{\"status\":\"OTA started\"}");
-  });
-  
-  // Add OTA progress callback
-  AsyncElegantOTA.onStart([]() {
-    otaUpdateInProgress = true;
-    otaStartTime = millis();
-    otaStatus = "Uploading firmware...";
-    otaProgress = 0.0;
-    
-    showMessageNonBlocking("OTA UPLOAD STARTED");
-    playBeepNonBlocking(200);
-  });
-  
-  AsyncElegantOTA.onProgress([](unsigned int progress, unsigned int total) {
-    otaProgress = (float)progress / total * 100.0;
-    otaStatus = "Uploading: " + String(otaProgress, 1) + "%";
-    
-    // Update display every 10% progress
-    if ((int)otaProgress % 10 == 0) {
-      forceDisplayUpdate = true;
-    }
-  });
-  
-  AsyncElegantOTA.onEnd([]() {
-    otaUpdateInProgress = false;
-    otaStatus = "Update complete! Rebooting...";
-    otaProgress = 100.0;
-    
-    showMessageNonBlocking("OTA COMPLETE!");
-    playBeepNonBlocking(300);
-    
-    // Save any pending data before reboot
-    if (targetModeActive) {
-      saveTargetStateToEEPROM(false);
-    }
-    saveSystemStateToEEPROM();
-    
-    delay(2000);
-    ESP.restart();
-  });
-  
-  otaServer.begin();
-  Serial.println("OTA server started on port 8080");
-}
-
-void displayOTAStatus() {
-  u8g2.clearBuffer();
-  
-  u8g2.setFont(u8g2_font_7x14_tf);
-  u8g2.drawStr(25, 12, "OTA UPDATE");
-  
-  u8g2.setFont(u8g2_font_6x12_tf);
-  u8g2.drawStr(5, 30, otaStatus.c_str());
-  
-  // Progress bar
-  u8g2.drawFrame(5, 40, 118, 8);
-  int progressWidth = (int)((otaProgress / 100.0) * 116);
-  if (progressWidth > 0) {
-    u8g2.drawBox(6, 41, progressWidth, 6);
-  }
-  
-  char buffer[20];
-  sprintf(buffer, "%.1f%%", otaProgress);
-  u8g2.drawStr(50, 55, buffer);
-  
-  u8g2.setFont(u8g2_font_5x8_tf);
-  u8g2.drawStr(5, 78, "Access: http://[ESP32_IP]:8080");
-  
-  u8g2.sendBuffer();
 }
