@@ -1,5 +1,5 @@
 /*
- * ESP32 Main Receiver - WITH INTEGRATED RELAY CONTROL
+ * ESP32 Main Receiver - WITH INTEGRATED RELAY CONTROL AND ENHANCED FEATURES
  * PIN CONNECTIONS FOR ESP32 WROOM 32 DevKit V1:
  * - D4  → NRF24L01 CE
  * - D5  → NRF24L01 CSN
@@ -39,6 +39,11 @@
  #include <ArduinoJson.h>
  #include <SPI.h>
  #include <RF24.h>
+ #include <EEPROM.h>
+ #include <Update.h>
+ #include <WebServer.h>
+ #include <ESPAsyncWebServer.h>
+ #include <AsyncElegantOTA.h>
  
  // ========================================
  // CONFIGURATION
@@ -48,8 +53,6 @@
  const char WIFI_PASS[] = "Artifact";
  
  // Backend Configuration - Update with your backend server details
- // If running locally: use "localhost" or "127.0.0.1"
- // If running on another device: use the IP address of your backend server
  const char BACKEND_HOST[] = "205.189.160.7";  // Updated to your server IP
  const int BACKEND_PORT = 3002;  // Updated to match your server port
  const char DEVICE_ID[] = "esp32_controller_001";
@@ -79,7 +82,7 @@
  // ========================================
  // PUMP CONTROL CONSTANTS
  // ========================================
- #define MAX_PUMP_RUNTIME_HOURS 4        // Maximum continuous runtime
+ #define MAX_PUMP_RUNTIME_HOURS 1        // Maximum continuous runtime
  #define PUMP_PROTECTION_DELAY 300000    // 5 min delay after protection trip
  #define CURRENT_SAMPLE_COUNT 10         // Samples for current averaging
  #define NORMAL_PUMP_CURRENT_MIN 2.0     // Minimum normal operating current (A)
@@ -120,13 +123,13 @@
  HTTPClient http;
  
  // ========================================
- // RADIO ADDRESSES (Motor controller addresses removed)
+ // RADIO ADDRESSES
  // ========================================
  const uint64_t rxAddr1 = 0xF0F0F0F0E1LL;  // Ground tank
  const uint64_t rxAddr2 = 0xF0F0F0F0E2LL;  // Roof tank
  
  // ========================================
- // DATA STRUCTURES (Simplified)
+ // DATA STRUCTURES
  // ========================================
  struct WaterLevelData {
    float levelPercent;
@@ -153,10 +156,54 @@
  };
  
  // ========================================
- // GLOBAL VARIABLES (Updated)
+ // ENHANCED MENU SYSTEM
+ // ========================================
+ enum PumpMenuLevel {
+   PUMP_STATUS_VIEW,     // Level 0: Show pump status
+   PUMP_MODE_SELECT,     // Level 1: Auto/Manual mode selection
+   PUMP_MANUAL_CONTROL   // Level 2: Enhanced manual pump control options
+ };
+ 
+ // Menu constants
+ #define MANUAL_CONTROL_OPTIONS 6  // ON, OFF, 10", 20", 35", BACK
+ #define MODE_SELECT_OPTIONS 3     // AUTO, MANUAL, BACK TO MAIN
+ 
+ // ========================================
+ // EEPROM CONFIGURATION
+ // ========================================
+ #define EEPROM_SIZE 512
+ #define EEPROM_TARGET_STATE_ADDR 0
+ #define EEPROM_SYSTEM_STATE_ADDR 100
+ #define EEPROM_MAGIC_NUMBER 0xABCD1234
+ 
+ // Persistent Data Structures
+ struct PersistentTargetState {
+   uint32_t magicNumber;           
+   bool wasActive;                 
+   float targetLevel;              
+   char description[20];           
+   unsigned long pausedTime;       
+   float levelWhenPaused;         
+   bool autoResumeEnabled;        
+   bool wasPowerFailure;          
+   uint32_t checksum;             
+ };
+ 
+ struct PersistentSystemState {
+   bool pumpWasRunning;           
+   bool autoModeWasEnabled;       
+   float lastGroundLevel;         
+   float lastRoofLevel;          
+   unsigned long lastUpdateTime;  
+   uint32_t bootCount;           
+   uint32_t checksum;            
+ };
+ 
+ // ========================================
+ // GLOBAL VARIABLES
  // ========================================
  WaterLevelData groundTankData, roofTankData;
- IntegratedPumpStatus pumpStatus;  // Replaces motorControllerStatus
+ IntegratedPumpStatus pumpStatus;
  
  bool groundTankConnected = false;
  bool roofTankConnected = false;
@@ -168,20 +215,43 @@
  bool forceDisplayUpdate = false;
  bool supplyFromGroundTank = false, supplyFromRoofTank = false;
  
- // Pump control variables (updated)
+ // Menu variables
+ PumpMenuLevel pumpMenuLevel = PUMP_STATUS_VIEW;
+ int pumpMenuSelection = 0;
+ 
+ // Pump control variables
  bool pumpState = false;
  bool autoControlEnabled = true;
  bool manualPumpControl = false;
  bool pumpProtectionActive = false;
  
- // Connection tracking (motor controller removed)
+ // Target-based pump control variables
+ bool targetModeActive = false;
+ float currentTargetLevel = 0.0;
+ String targetDescription = "";
+ unsigned long targetStartTime = 0;
+ 
+ // Recovery variables
+ PersistentTargetState persistentTarget;
+ PersistentSystemState persistentSystem;
+ bool needsPowerRecovery = false;
+ unsigned long powerRecoveryStartTime = 0;
+ unsigned long lastEEPROMSave = 0;
+ 
+ // Recovery timing constants
+ #define POWER_RECOVERY_DELAY 10000      
+ #define EEPROM_SAVE_INTERVAL 30000      
+ #define SIGNIFICANT_LEVEL_CHANGE 5.0    
+ #define MAJOR_LEVEL_CHANGE 10.0
+ 
+ // Connection tracking
  unsigned long lastGroundTankTime = 0;
  unsigned long lastRoofTankTime = 0;
  unsigned long lastDisplayUpdate = 0;
  unsigned long lastLedToggle = 0;
  unsigned long lastCloudUpdate = 0;
  
- // NEW: Pump monitoring variables
+ // Pump monitoring variables
  unsigned long pumpStartTime = 0;
  unsigned long lastCurrentReading = 0;
  unsigned long lastPowerCalculation = 0;
@@ -197,9 +267,7 @@
  unsigned long rgbStateStartTime = 0;
  uint8_t currentBrightness = 255;
  
- // ========================================
- // ENCODER VARIABLES (Same as original)
- // ========================================
+ // Encoder variables
  volatile int encoderPos = 0;
  volatile bool lastClkState = HIGH;
  int lastEncoderPos = 0;
@@ -212,7 +280,7 @@
  unsigned long lastDebounceTime = 0;
  bool buttonPressed = false;
  
- // Audio System (Same as original)
+ // Audio System
  enum AudioState { AUDIO_IDLE, AUDIO_BEEP, AUDIO_ALERT };
  AudioState audioState = AUDIO_IDLE;
  unsigned long audioStartTime = 0;
@@ -222,19 +290,19 @@
  uint8_t audioRepeat = 0;
  bool buzzerMuted = false;
  
- // Message System (Same as original)
+ // Message System
  bool messageActive = false;
  unsigned long messageStartTime = 0;
  char currentMessage[32] = "";
  bool returnToMenuAfterMessage = false;
  
- // Water Level Thresholds (Same as original)
+ // Water Level Thresholds
  #define GROUND_TANK_LOWER_THRESHOLD 15.0
  #define GROUND_TANK_UPPER_THRESHOLD 30.0
  #define ROOF_TANK_LOWER_THRESHOLD 20.0
  #define ROOF_TANK_UPPER_THRESHOLD 80.0
  
- // Timing constants (Updated)
+ // Timing constants
  #define TOTAL_MODES 8
  #define MENU_ITEMS_VISIBLE 5
  #define CONNECTION_TIMEOUT 15000
@@ -256,8 +324,12 @@
  unsigned long lastBackendResponse = 0;
  int backendErrorCount = 0;
  
+ // Command checking variables
+ unsigned long lastCommandCheck = 0;
+ const unsigned long COMMAND_CHECK_INTERVAL = 5000;  // Check every 5 seconds
+ 
  // ========================================
- // NANO-STYLE ENCODER INTERRUPT (Same as original)
+ // ENCODER INTERRUPT
  // ========================================
  void IRAM_ATTR updateEncoder() {
    bool clkState = digitalRead(ENCODER_CLK);
@@ -274,7 +346,209 @@
  }
  
  // ========================================
- // NEW: INTEGRATED PUMP CONTROL FUNCTIONS
+ // EEPROM UTILITY FUNCTIONS
+ // ========================================
+ uint32_t calculateChecksum(void* data, size_t length) {
+   uint32_t checksum = 0;
+   uint8_t* bytes = (uint8_t*)data;
+   for (size_t i = 0; i < length - sizeof(uint32_t); i++) {
+     checksum += bytes[i];
+   }
+   return checksum;
+ }
+ 
+ void saveTargetStateToEEPROM(bool isPowerFailure = false) {
+   if (!targetModeActive && !isPowerFailure) {
+     return;
+   }
+   
+   persistentTarget.magicNumber = EEPROM_MAGIC_NUMBER;
+   persistentTarget.wasActive = targetModeActive;
+   persistentTarget.targetLevel = currentTargetLevel;
+   strncpy(persistentTarget.description, targetDescription.c_str(), 19);
+   persistentTarget.description[19] = '\0';
+   persistentTarget.pausedTime = millis();
+   persistentTarget.levelWhenPaused = roofTankConnected ? roofTankData.levelInches : 0.0;
+   persistentTarget.autoResumeEnabled = true;
+   persistentTarget.wasPowerFailure = isPowerFailure;
+   persistentTarget.checksum = calculateChecksum(&persistentTarget, sizeof(persistentTarget));
+   
+   EEPROM.put(EEPROM_TARGET_STATE_ADDR, persistentTarget);
+   EEPROM.commit();
+   
+   Serial.println("Target state saved to EEPROM");
+ }
+ 
+ void saveSystemStateToEEPROM() {
+   persistentSystem.pumpWasRunning = pumpState;
+   persistentSystem.autoModeWasEnabled = autoControlEnabled;
+   persistentSystem.lastGroundLevel = groundTankConnected ? groundTankData.levelPercent : 0.0;
+   persistentSystem.lastRoofLevel = roofTankConnected ? roofTankData.levelInches : 0.0;
+   persistentSystem.lastUpdateTime = millis();
+   persistentSystem.bootCount++;
+   persistentSystem.checksum = calculateChecksum(&persistentSystem, sizeof(persistentSystem));
+   
+   EEPROM.put(EEPROM_SYSTEM_STATE_ADDR, persistentSystem);
+   EEPROM.commit();
+   
+   lastEEPROMSave = millis();
+ }
+ 
+ bool loadStateFromEEPROM() {
+   EEPROM.get(EEPROM_TARGET_STATE_ADDR, persistentTarget);
+   EEPROM.get(EEPROM_SYSTEM_STATE_ADDR, persistentSystem);
+   
+   if (persistentTarget.magicNumber != EEPROM_MAGIC_NUMBER) {
+     Serial.println("No valid target state in EEPROM");
+     return false;
+   }
+   
+   uint32_t expectedTargetChecksum = persistentTarget.checksum;
+   uint32_t actualTargetChecksum = calculateChecksum(&persistentTarget, sizeof(persistentTarget));
+   
+   if (expectedTargetChecksum != actualTargetChecksum) {
+     Serial.println("Target state EEPROM data corrupted");
+     return false;
+   }
+   
+   Serial.println("Valid EEPROM target state found");
+   return true;
+ }
+ 
+ void clearEEPROMState() {
+   persistentTarget.magicNumber = 0;
+   persistentTarget.wasActive = false;
+   EEPROM.put(EEPROM_TARGET_STATE_ADDR, persistentTarget);
+   EEPROM.commit();
+   Serial.println("EEPROM target state cleared");
+ }
+ 
+ void clearTargetState() {
+   targetModeActive = false;
+   currentTargetLevel = 0.0;
+   targetDescription = "";
+   Serial.println("Target state cleared");
+ }
+ 
+ // ========================================
+ // POWER RECOVERY FUNCTIONS
+ // ========================================
+ bool canRecoverFromPower() {
+   if (!persistentTarget.wasActive || !persistentTarget.autoResumeEnabled) {
+     Serial.println("Cannot recover: Target was not active or auto-resume disabled");
+     return false;
+   }
+   
+   if (!roofTankConnected || !roofSensorWorking || 
+       !groundTankConnected || !groundSensorWorking) {
+     Serial.println("Cannot recover: Sensors not ready");
+     return false;
+   }
+   
+   if (pumpStatus.protectionActive) {
+     Serial.println("Cannot recover: Protection system active");
+     return false;
+   }
+   
+   if (groundTankData.levelPercent < GROUND_TANK_LOWER_THRESHOLD) {
+     Serial.println("Cannot recover: Ground tank too low");
+     return false;
+   }
+   
+   Serial.println("Power recovery validation passed - safe to recover");
+   return true;
+ }
+ 
+ bool attemptPowerRecovery() {
+   if (!canRecoverFromPower()) {
+     clearEEPROMState();
+     return false;
+   }
+   
+   float currentLevel = roofTankData.levelInches;
+   float targetLevel = persistentTarget.targetLevel;
+   float previousLevel = persistentTarget.levelWhenPaused;
+   
+   if (currentLevel >= targetLevel) {
+     Serial.println("Target already achieved during power outage");
+     showMessageNonBlocking("TARGET COMPLETED!");
+     playBeepNonBlocking(200);
+     clearEEPROMState();
+     return false;
+   }
+   
+   float levelChange = currentLevel - previousLevel;
+   
+   if (abs(levelChange) >= MAJOR_LEVEL_CHANGE) {
+     char message[50];
+     if (levelChange > 0) {
+       sprintf(message, "LEVEL ROSE +%.1f\" DURING OUTAGE", levelChange);
+     } else {
+       sprintf(message, "LEVEL DROPPED %.1f\" DURING OUTAGE", abs(levelChange));
+     }
+     showMessageNonBlocking(message);
+     delay(3000);
+   }
+   
+   float remainingToTarget = targetLevel - currentLevel;
+   if (remainingToTarget < 1.0) {
+     Serial.println("Less than 1 inch remaining - target nearly complete");
+     showMessageNonBlocking("TARGET NEARLY DONE!");
+     clearEEPROMState();
+     return false;
+   }
+   
+   targetModeActive = true;
+   currentTargetLevel = persistentTarget.targetLevel;
+   targetDescription = String(persistentTarget.description);
+   manualPumpControl = true;
+   autoControlEnabled = false;
+   
+   char reason[100];
+   sprintf(reason, "Power recovery: %s (%.1f\" → %.1f\")", 
+           persistentTarget.description, 
+           currentLevel,
+           targetLevel);
+   
+   setPumpState(true, reason);
+   
+   char message[50];
+   sprintf(message, "RECOVERED: %s", persistentTarget.description);
+   showMessageNonBlocking(message);
+   playBeepNonBlocking(200);
+   
+   Serial.println("Power recovery successful!");
+   return true;
+ }
+ 
+ void handlePowerRecovery() {
+   if (!needsPowerRecovery) return;
+   
+   unsigned long currentTime = millis();
+   
+   if (currentTime - powerRecoveryStartTime < POWER_RECOVERY_DELAY) {
+     static unsigned long lastCountdown = 0;
+     if (currentTime - lastCountdown > 1000) {
+       int remaining = (POWER_RECOVERY_DELAY - (currentTime - powerRecoveryStartTime)) / 1000;
+       char message[30];
+       sprintf(message, "STABILIZING... %ds", remaining);
+       showMessageNonBlocking(message);
+       lastCountdown = currentTime;
+     }
+     return;
+   }
+   
+   needsPowerRecovery = false;
+   
+   if (!attemptPowerRecovery()) {
+     Serial.println("Power recovery failed or not needed");
+     showMessageNonBlocking("RECOVERY FAILED");
+     playBeepNonBlocking(50);
+   }
+ }
+ 
+ // ========================================
+ // INTEGRATED PUMP CONTROL FUNCTIONS
  // ========================================
  void setupPumpControl() {
    pinMode(RELAY_PIN, OUTPUT);
@@ -297,6 +571,47 @@
    hourlyResetTime = millis();
    
    Serial.println("Integrated pump control initialized");
+ }
+ 
+ void startTargetPumpOperation(float targetInches, const char* description) {
+   if (pumpStatus.protectionActive) {
+     showMessageWithAutoReturn("PROTECTION ACTIVE");
+     return;
+   }
+   
+   if (!roofTankConnected || !roofSensorWorking) {
+     showMessageWithAutoReturn("ROOF SENSOR ERROR");
+     return;
+   }
+   
+   if (!groundTankConnected || !groundSensorWorking) {
+     showMessageWithAutoReturn("GROUND SENSOR ERROR");
+     return;
+   }
+   
+   if (roofTankData.levelInches >= targetInches) {
+     showMessageWithAutoReturn("TARGET ALREADY MET");
+     return;
+   }
+   
+   if (groundTankData.levelPercent < GROUND_TANK_LOWER_THRESHOLD) {
+     showMessageWithAutoReturn("GROUND TANK TOO LOW");
+     return;
+   }
+   
+   clearEEPROMState();
+   
+   targetModeActive = true;
+   currentTargetLevel = targetInches;
+   targetDescription = String(description);
+   
+   char reason[50];
+   sprintf(reason, "Target mode: %s", description);
+   setPumpState(true, reason);
+   
+   char message[30];
+   sprintf(message, "TARGET: %s", description);
+   showMessageWithAutoReturn(message);
  }
  
  float readPumpCurrent() {
@@ -337,18 +652,6 @@
      
      // Mark readings as valid after first full cycle
      if (currentReadingIndex == 0) currentReadingsValid = true;
-     
-     // Debug output every 10 readings
-     static int debugCounter = 0;
-     debugCounter++;
-     if (debugCounter >= 10) {
-       Serial.print("Current reading: ");
-       Serial.print(newCurrent);
-       Serial.print("A, Average: ");
-       Serial.print(pumpStatus.currentAmps);
-       Serial.println("A");
-       debugCounter = 0;
-     }
      
      lastCurrentReading = currentTime;
    }
@@ -452,18 +755,45 @@
      
      if (newState) {
        pumpStartTime = millis();
-       Serial.print("Pump STARTED - Reason: ");
+       if (targetModeActive) {
+         targetStartTime = millis();
+         saveTargetStateToEEPROM(false);
+         Serial.print("Pump STARTED - Target Mode: ");
+         Serial.print(targetDescription);
+         Serial.print(" (");
+         Serial.print(currentTargetLevel);
+         Serial.println(" inches)");
+       } else {
+         Serial.print("Pump STARTED - Reason: ");
+         Serial.println(reason);
+       }
      } else {
-       unsigned long runtime = (millis() - pumpStartTime) / 60000;  // minutes
+       unsigned long runtime = (millis() - pumpStartTime) / 60000;
        pumpStatus.runTimeMinutes += runtime;
        pumpStatus.totalRunTimeHours = pumpStatus.runTimeMinutes / 60;
-       Serial.print("Pump STOPPED - Reason: ");
+       
+       if (targetModeActive) {
+         Serial.print("Pump STOPPED - Target Mode: ");
+         Serial.println(reason);
+         
+         if (strstr(reason, "failure") != NULL || 
+             strstr(reason, "Sensor") != NULL ||
+             strstr(reason, "protection") != NULL) {
+           saveTargetStateToEEPROM(false);
+         } else {
+           clearEEPROMState();
+         }
+         
+         targetModeActive = false;
+         currentTargetLevel = 0.0;
+         targetDescription = "";
+       } else {
+         Serial.print("Pump STOPPED - Reason: ");
+         Serial.println(reason);
+       }
      }
-     Serial.println(reason);
      
-     // Send event to backend
      sendPumpEventToBackend(newState ? "pump_start" : "pump_stop", reason);
-     
      forceDisplayUpdate = true;
    }
  }
@@ -483,7 +813,7 @@
  }
  
  // ========================================
- // RGB LED FUNCTIONS (Updated for new status)
+ // RGB LED FUNCTIONS
  // ========================================
  void setupRGBLED() {
    pinMode(RGB_RED_PIN, OUTPUT);
@@ -577,7 +907,7 @@
  }
  
  // ========================================
- // ENCODER AND BUTTON HANDLING (Updated for new menus)
+ // ENCODER HANDLING
  // ========================================
  void checkEncoderNanoStyle() {
    if (encoderPos != lastEncoderPos) {
@@ -598,8 +928,26 @@
          
          playBeepNonBlocking(20);
          forceDisplayUpdate = true;
+       } else if (currentView == 4) {
+         switch (pumpMenuLevel) {
+           case PUMP_MODE_SELECT:
+             pumpMenuSelection = (pumpMenuSelection + singleSteps + MODE_SELECT_OPTIONS) % MODE_SELECT_OPTIONS;
+             break;
+             
+           case PUMP_MANUAL_CONTROL:
+             pumpMenuSelection = (pumpMenuSelection + singleSteps + MANUAL_CONTROL_OPTIONS) % MANUAL_CONTROL_OPTIONS;
+             break;
+             
+           default:
+             currentView = -1;
+             pumpMenuLevel = PUMP_STATUS_VIEW;
+             break;
+         }
+         playBeepNonBlocking(20);
+         forceDisplayUpdate = true;
        } else {
          currentView = -1;
+         pumpMenuLevel = PUMP_STATUS_VIEW;
          playBeepNonBlocking(30);
          forceDisplayUpdate = true;
        }
@@ -637,29 +985,106 @@
      currentView = selectedMode;
      
      if (currentView == 3) {
-       // Reset option
        showMessageNonBlocking("RESETTING...");
-       // Add reset logic here
        currentView = -1;
      }
    } else if (currentView == 4) {
-     // Motor Control screen (now Pump Control)
-     if (pumpStatus.protectionActive) {
+     if (pumpStatus.protectionActive && pumpMenuLevel != PUMP_STATUS_VIEW) {
        showMessageWithAutoReturn("PROTECTION ACTIVE");
+       pumpMenuLevel = PUMP_STATUS_VIEW;
        currentView = -1;
-     } else if (autoControlEnabled) {
-       autoControlEnabled = false;
-       showMessageWithAutoReturn("MANUAL MODE");
-     } else {
-       setPumpState(!pumpState, "Manual control");
+       return;
+     }
+     
+     switch (pumpMenuLevel) {
+       case PUMP_STATUS_VIEW:
+         pumpMenuLevel = PUMP_MODE_SELECT;
+         pumpMenuSelection = autoControlEnabled ? 0 : 1;
+         forceDisplayUpdate = true;
+         break;
+         
+       case PUMP_MODE_SELECT:
+         if (pumpMenuSelection == 0) {
+           // Auto Mode selected
+           autoControlEnabled = true;
+           manualPumpControl = false;
+           if (targetModeActive) {
+             setPumpState(false, "Switched to auto mode");
+           }
+           showMessageWithAutoReturn("AUTO MODE ENABLED");
+           pumpMenuLevel = PUMP_STATUS_VIEW;
+           currentView = -1;
+         } else if (pumpMenuSelection == 1) {
+           // Manual Mode selected
+           autoControlEnabled = false;
+           manualPumpControl = true;
+           pumpMenuLevel = PUMP_MANUAL_CONTROL;
+           pumpMenuSelection = 0;
+           forceDisplayUpdate = true;
+         } else if (pumpMenuSelection == 2) {
+           // Back to Main Menu selected
+           pumpMenuLevel = PUMP_STATUS_VIEW;
+           currentView = -1;  // Go back to main menu
+           playBeepNonBlocking(50);
+           forceDisplayUpdate = true;
+         }
+         break;
+         
+       case PUMP_MANUAL_CONTROL:
+         switch (pumpMenuSelection) {
+           case 0:
+             if (targetModeActive) {
+               setPumpState(false, "Stopping target mode");
+               delay(100);
+             }
+             setPumpState(true, "Manual control - CONTINUOUS ON");
+             showMessageWithAutoReturn("PUMP ON");
+             pumpMenuLevel = PUMP_STATUS_VIEW;
+             currentView = -1;
+             break;
+             
+           case 1:
+             if (targetModeActive) {
+               setPumpState(false, "Manual control - Target mode stopped");
+             } else {
+               setPumpState(false, "Manual control - OFF");
+             }
+             showMessageWithAutoReturn("PUMP OFF");
+             pumpMenuLevel = PUMP_STATUS_VIEW;
+             currentView = -1;
+             break;
+             
+           case 2:
+             startTargetPumpOperation(10.0, "10 INCH");
+             pumpMenuLevel = PUMP_STATUS_VIEW;
+             currentView = -1;
+             break;
+             
+           case 3:
+             startTargetPumpOperation(20.0, "20 INCH");
+             pumpMenuLevel = PUMP_STATUS_VIEW;
+             currentView = -1;
+             break;
+             
+           case 4:
+             startTargetPumpOperation(35.0, "35 INCH");
+             pumpMenuLevel = PUMP_STATUS_VIEW;
+             currentView = -1;
+             break;
+             
+           case 5:
+             pumpMenuLevel = PUMP_MODE_SELECT;
+             pumpMenuSelection = autoControlEnabled ? 0 : 1;
+             forceDisplayUpdate = true;
+             break;
+         }
+         break;
      }
    } else if (currentView == 5) {
-     // Power Consumption screen - reset daily usage
      resetDailyUsage();
      showMessageWithAutoReturn("USAGE RESET");
      currentView = -1;
    } else if (currentView == 6) {
-     // Buzzer Settings screen
      buzzerMuted = !buzzerMuted;
      if (!buzzerMuted) {
        playBeepNonBlocking(100);
@@ -674,7 +1099,7 @@
  }
  
  // ========================================
- // AUDIO FUNCTIONS (Same as original)
+ // AUDIO FUNCTIONS
  // ========================================
  void playBeepNonBlocking(uint8_t duration) {
    if (audioState == AUDIO_IDLE && !buzzerMuted) {
@@ -735,7 +1160,7 @@
  }
  
  // ========================================
- // MESSAGE FUNCTIONS (Same as original)
+ // MESSAGE FUNCTIONS
  // ========================================
  void showMessageNonBlocking(const char* message) {
    strncpy(currentMessage, message, 31);
@@ -756,7 +1181,7 @@
  }
  
  // ========================================
- // DISPLAY FUNCTIONS (Updated for integrated pump)
+ // DISPLAY FUNCTIONS
  // ========================================
  void updateDisplayAlways() {
    unsigned long currentTime = millis();
@@ -837,7 +1262,7 @@
      "2. Ground Tank",
      "3. Roof Tank", 
      "4. Reset System",
-     "5. Pump Control",     // Updated from Motor Control
+     "5. Pump Control",
      "6. Power Usage",
      "7. Buzzer Settings",
      "8. System Info"
@@ -1022,40 +1447,127 @@
  void displayPumpControl() {
    u8g2.clearBuffer();
    
-   u8g2.setFont(u8g2_font_7x14_tf);
-   u8g2.drawStr(25, 12, "PUMP CONTROL");
-   
-   char buffer[25];
-   u8g2.setFont(u8g2_font_6x12_tf);
-   
-   sprintf(buffer, "Pump: %s", pumpState ? "RUNNING" : "STOPPED");
-   u8g2.drawStr(5, 25, buffer);
-   
-   sprintf(buffer, "Mode: %s", autoControlEnabled ? "AUTO" : "MANUAL");
-   u8g2.drawStr(5, 35, buffer);
-   
-   if (pumpStatus.protectionActive) {
-     u8g2.drawStr(5, 45, "PROTECTION ACTIVE");
-     if (pumpStatus.overCurrentProtection) {
-       u8g2.drawStr(5, 55, "Overcurrent");
-     }
-     if (pumpStatus.overTimeProtection) {
-       u8g2.drawStr(5, 65, "Runtime exceeded");
-     }
-   } else {
-     sprintf(buffer, "Current: %.1fA", pumpStatus.currentAmps);
-     u8g2.drawStr(5, 45, buffer);
-     
-     sprintf(buffer, "Power: %.0fW", pumpStatus.powerWatts);
-     u8g2.drawStr(5, 55, buffer);
+   switch (pumpMenuLevel) {
+     case PUMP_STATUS_VIEW:
+       u8g2.setFont(u8g2_font_7x14_tf);
+       u8g2.drawStr(25, 12, "PUMP CONTROL");
+       
+       char buffer[30];
+       u8g2.setFont(u8g2_font_6x12_tf);
+       
+       sprintf(buffer, "Mode: %s", autoControlEnabled ? "AUTO" : "MANUAL");
+       u8g2.drawStr(5, 25, buffer);
+       
+       if (targetModeActive) {
+         sprintf(buffer, "Target: %s", targetDescription.c_str());
+         u8g2.drawStr(5, 35, buffer);
+         
+         sprintf(buffer, "Current: %.1f\"", roofTankData.levelInches);
+         u8g2.drawStr(5, 45, buffer);
+         
+         sprintf(buffer, "Remaining: %.1f\"", currentTargetLevel - roofTankData.levelInches);
+         u8g2.drawStr(5, 55, buffer);
+       } else {
+         sprintf(buffer, "Pump: %s", pumpState ? "RUNNING" : "STOPPED");
+         u8g2.drawStr(5, 35, buffer);
+         
+         if (pumpStatus.protectionActive) {
+           u8g2.drawStr(5, 45, "PROTECTION ACTIVE");
+         } else {
+           sprintf(buffer, "Current: %.1fA", pumpStatus.currentAmps);
+           u8g2.drawStr(5, 45, buffer);
+           
+           sprintf(buffer, "Power: %.0fW", pumpStatus.powerWatts);
+           u8g2.drawStr(5, 55, buffer);
+         }
+       }
+       
+       u8g2.setFont(u8g2_font_5x8_tf);
+       u8g2.drawStr(5, 78, "Press: Mode Selection");
+       break;
+       
+     case PUMP_MODE_SELECT:
+       u8g2.setFont(u8g2_font_7x14_tf);
+       u8g2.drawStr(20, 12, "SELECT MODE");
+       
+       u8g2.setFont(u8g2_font_6x12_tf);
+       
+       // Auto Mode option
+       if (pumpMenuSelection == 0) {
+         u8g2.drawBox(10, 22, 108, 12);
+         u8g2.setDrawColor(0);
+         u8g2.drawStr(15, 32, "AUTO MODE");
+         u8g2.setDrawColor(1);
+       } else {
+         u8g2.drawStr(15, 32, "AUTO MODE");
+       }
+       
+       // Manual Mode option  
+       if (pumpMenuSelection == 1) {
+         u8g2.drawBox(10, 37, 108, 12);
+         u8g2.setDrawColor(0);
+         u8g2.drawStr(15, 47, "MANUAL MODE");
+         u8g2.setDrawColor(1);
+       } else {
+         u8g2.drawStr(15, 47, "MANUAL MODE");
+       }
+       
+       // Back to Main Menu option
+       if (pumpMenuSelection == 2) {
+         u8g2.drawBox(10, 52, 108, 12);
+         u8g2.setDrawColor(0);
+         u8g2.drawStr(15, 62, "BACK TO MAIN MENU");
+         u8g2.setDrawColor(1);
+       } else {
+         u8g2.drawStr(15, 62, "BACK TO MAIN MENU");
+       }
+       
+       u8g2.setFont(u8g2_font_5x8_tf);
+       u8g2.drawStr(5, 78, "Rotate: Select  Press: Confirm");
+       break;
+       
+     case PUMP_MANUAL_CONTROL:
+       u8g2.setFont(u8g2_font_7x14_tf);
+       u8g2.drawStr(15, 12, "MANUAL CONTROL");
+       
+       u8g2.setFont(u8g2_font_6x12_tf);
+       
+       const char* manualOptions[] = {
+         "1. PUMP ON",
+         "2. PUMP OFF", 
+         "3. TARGET 10\"",
+         "4. TARGET 20\"",
+         "5. TARGET 35\"",
+         "6. BACK TO MODE"
+       };
+       
+       int startOption = 0;
+       int visibleOptions = 5;
+       
+       if (pumpMenuSelection >= visibleOptions) {
+         startOption = pumpMenuSelection - visibleOptions + 1;
+       }
+       
+       for (int i = 0; i < visibleOptions && (startOption + i) < MANUAL_CONTROL_OPTIONS; i++) {
+         int optionIndex = startOption + i;
+         int yPos = 25 + (i * 10);
+         
+         if (optionIndex == pumpMenuSelection) {
+           u8g2.drawBox(5, yPos - 8, 118, 10);
+           u8g2.setDrawColor(0);
+           u8g2.drawStr(8, yPos, manualOptions[optionIndex]);
+           u8g2.setDrawColor(1);
+         } else {
+           u8g2.drawStr(8, yPos, manualOptions[optionIndex]);
+         }
+       }
+       
+       u8g2.setFont(u8g2_font_5x8_tf);
+       sprintf(buffer, "Current: %s", pumpState ? "RUNNING" : "STOPPED");
+       u8g2.drawStr(5, 78, buffer);
+       break;
    }
    
-   u8g2.setFont(u8g2_font_5x8_tf);
-   if (pumpStatus.protectionActive) {
-     u8g2.drawStr(5, 78, "Press: View Only");
-   } else {
-     u8g2.drawStr(5, 78, "Press: Toggle Mode/State");
-   }
    u8g2.sendBuffer();
  }
  
@@ -1140,7 +1652,7 @@
  }
  
  // ========================================
- // BACKEND COMMUNICATION (Updated)
+ // BACKEND COMMUNICATION
  // ========================================
  void sendStatusToBackend() {
    if (WiFi.status() != WL_CONNECTED) {
@@ -1172,10 +1684,10 @@
    roofTank["sensor_working"] = roofSensorWorking;
    roofTank["water_supply_on"] = supplyFromRoofTank;
    
-   // Integrated pump data (replaces motor data)
+   // Integrated pump data
    JsonObject pump = doc.createNestedObject("pump");
    pump["running"] = pumpStatus.pumpRunning;
-   pump["manual_override"] = manualPumpControl;  // Use the correct variable
+   pump["manual_override"] = manualPumpControl;
    pump["current_amps"] = pumpStatus.currentAmps;
    pump["power_watts"] = pumpStatus.powerWatts;
    pump["daily_consumption"] = pumpStatus.dailyConsumption;
@@ -1189,37 +1701,26 @@
    // System state
    JsonObject system = doc.createNestedObject("system");
    system["auto_mode_enabled"] = autoControlEnabled;
-   system["manual_pump_control"] = manualPumpControl;  // Fixed variable name
+   system["manual_pump_control"] = manualPumpControl;
    system["water_supply_active"] = waterSupplyOn;
    
    String jsonString;
    serializeJson(doc, jsonString);
    
-   // Debug: Print the JSON being sent (first 200 characters)
-   Serial.print("JSON payload: ");
-   Serial.println(jsonString.substring(0, 200));
-   
    String url = String("http://") + BACKEND_HOST + ":" + BACKEND_PORT + API_BASE_URL + "/devices/status/update";
-   Serial.print("Sending status to: ");
-   Serial.println(url);
    
    http.begin(url);
    http.addHeader("Content-Type", "application/json");
    
    int httpResponseCode = http.POST(jsonString);
-   Serial.print("HTTP Response Code: ");
-   Serial.println(httpResponseCode);
    
    if (httpResponseCode > 0) {
      backendConnected = true;
      lastBackendResponse = millis();
      backendErrorCount = 0;
-     Serial.println("Backend update successful");
    } else {
      backendConnected = false;
      backendErrorCount++;
-     Serial.print("Backend update failed, error count: ");
-     Serial.println(backendErrorCount);
    }
    
    http.end();
@@ -1227,12 +1728,10 @@
  
  void sendPumpEventToBackend(const char* eventType, const char* reason) {
    if (WiFi.status() != WL_CONNECTED) {
-     Serial.println("WiFi not connected, skipping pump event");
      return;
    }
    
    DynamicJsonDocument doc(512);
-   doc["device_id"] = DEVICE_ID;
    doc["event_type"] = eventType;
    doc["pump_on"] = pumpState;
    doc["auto_mode"] = autoControlEnabled;
@@ -1246,25 +1745,17 @@
    String jsonString;
    serializeJson(doc, jsonString);
    
-   // Debug: Print the JSON being sent
-   Serial.print("Pump event JSON: ");
-   Serial.println(jsonString);
-   
    String url = String("http://") + BACKEND_HOST + ":" + BACKEND_PORT + API_BASE_URL + "/devices/events/pump";
-   Serial.print("Sending pump event to: ");
-   Serial.println(url);
    
    http.begin(url);
    http.addHeader("Content-Type", "application/json");
    
    int httpResponseCode = http.POST(jsonString);
-   Serial.print("Pump event HTTP Response Code: ");
-   Serial.println(httpResponseCode);
    http.end();
  }
  
  // ========================================
- // RADIO COMMUNICATION (Simplified - no motor controller)
+ // RADIO COMMUNICATION
  // ========================================
  void handleRadioReceive() {
    if (radio.available()) {
@@ -1299,7 +1790,7 @@
  }
  
  // ========================================
- // SYSTEM FUNCTIONS (Updated)
+ // SYSTEM FUNCTIONS
  // ========================================
  void checkConnectionTimeouts() {
    unsigned long currentTime = millis();
@@ -1318,7 +1809,44 @@
  }
  
  void handleAutoPumpControl() {
-   if (!autoControlEnabled || pumpStatus.protectionActive) return;
+   // Handle target mode monitoring (works in manual mode)
+   if (targetModeActive && pumpState) {
+     bool shouldStop = false;
+     const char* stopReason = "";
+     
+     if (roofTankConnected && roofSensorWorking && 
+         roofTankData.levelInches >= currentTargetLevel) {
+       shouldStop = true;
+       stopReason = "Target level reached";
+     }
+     else if (groundTankConnected && groundSensorWorking && 
+              groundTankData.levelPercent < GROUND_TANK_LOWER_THRESHOLD) {
+       shouldStop = true;
+       stopReason = "Ground tank protection";
+     }
+     else if (!roofTankConnected || !roofSensorWorking || 
+              !groundTankConnected || !groundSensorWorking) {
+       shouldStop = true;
+       stopReason = "Sensor failure protection";
+     }
+     
+     if (shouldStop) {
+       setPumpState(false, stopReason);
+       
+       if (strstr(stopReason, "Target") != NULL) {
+         playBeepNonBlocking(200);
+         showMessageNonBlocking("TARGET COMPLETE!");
+       } else {
+         playAlertSoundNonBlocking();
+         showMessageNonBlocking("TARGET PAUSED");
+       }
+       
+       return;
+     }
+   }
+   
+   // Normal auto control (only when auto mode enabled and no target mode active)
+   if (!autoControlEnabled || pumpStatus.protectionActive || targetModeActive) return;
    
    if (groundTankConnected && groundSensorWorking && 
        roofTankConnected && roofSensorWorking) {
@@ -1357,11 +1885,11 @@
  }
  
  // ========================================
- // SETUP FUNCTION (Updated)
+ // SETUP FUNCTION
  // ========================================
  void setup() {
    Serial.begin(115200);
-   Serial.println("ESP32 Water Level Receiver - Integrated Pump Control");
+   Serial.println("ESP32 Water Level Receiver - Enhanced Pump Control");
    
    // WiFi setup
    WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -1376,6 +1904,10 @@
      Serial.print("WiFi connected! IP: ");
      Serial.println(WiFi.localIP());
    }
+   
+   // Initialize EEPROM
+   EEPROM.begin(EEPROM_SIZE);
+   Serial.println("EEPROM initialized");
    
    // Configure pins
    pinMode(ENCODER_CLK, INPUT_PULLUP);
@@ -1422,6 +1954,22 @@
    groundTankData = {0.0, 0.0, false, false, 1};
    roofTankData = {0.0, 0.0, false, false, 2};
    
+   // Check for power-fail recovery AFTER hardware is ready
+   if (loadStateFromEEPROM()) {
+     if (persistentTarget.wasActive) {
+       Serial.println("POWER RECOVERY MODE ACTIVATED");
+       
+       showMessageNonBlocking("POWER RECOVERY");
+       playBeepNonBlocking(150);
+       
+       needsPowerRecovery = true;
+       powerRecoveryStartTime = millis();
+       
+       currentRGBState = RGB_PULSE_YELLOW;
+       rgbStateStartTime = millis();
+     }
+   }
+   
    playBeepNonBlocking(100);
    showMessageNonBlocking("READY");
    
@@ -1436,17 +1984,20 @@
    // Clear any protection system issues for testing
    clearProtectionSystem();
    
-   Serial.println("Setup complete - Integrated pump control ready!");
+   Serial.println("Setup complete - Enhanced pump control ready!");
  }
  
  // ========================================
- // MAIN LOOP (Updated)
+ // MAIN LOOP
  // ========================================
  void loop() {
    // Input handling
    checkEncoderNanoStyle();
    checkButtonWithDebounce();
    updateDisplayAlways();
+   
+   // Handle power recovery
+   handlePowerRecovery();
    
    // System operations
    updateRGBStatus();
@@ -1466,5 +2017,113 @@
    // Background operations
    updateBackendVariablesBackground();
    
+   // Check for pump commands
+   checkForPumpCommands();
+   
+   // Periodic EEPROM saves during active operations
+   unsigned long currentTime = millis();
+   if (currentTime - lastEEPROMSave > EEPROM_SAVE_INTERVAL) {
+     if (targetModeActive || pumpState) {
+       saveSystemStateToEEPROM();
+       
+       if (targetModeActive) {
+         saveTargetStateToEEPROM(false);
+       }
+     }
+   }
+   
    yield();
  }
+
+// ========================================
+// COMMAND PROCESSING FUNCTIONS
+// ========================================
+void checkForPumpCommands() {
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastCommandCheck >= COMMAND_CHECK_INTERVAL) {
+    if (WiFi.status() == WL_CONNECTED) {
+      // Check for commands in Redis via HTTP endpoint
+      String url = String("http://") + BACKEND_HOST + ":" + BACKEND_PORT + API_BASE_URL + "/devices/pump/command/" + DEVICE_ID;
+      
+      http.begin(url);
+      http.addHeader("Content-Type", "application/json");
+      
+      int httpResponseCode = http.GET();
+      
+      if (httpResponseCode == 200) {
+        String payload = http.getString();
+        if (payload.length() > 0 && payload != "null") {
+          processPumpCommand(payload);
+        }
+      }
+      
+      http.end();
+    }
+    
+    lastCommandCheck = currentTime;
+  }
+}
+
+void processPumpCommand(const String& commandJson) {
+  DynamicJsonDocument doc(512);
+  DeserializationError error = deserializeJson(doc, commandJson);
+  
+  if (error) {
+    Serial.println("Failed to parse pump command JSON");
+    return;
+  }
+  
+  const char* action = doc["action"];
+  const char* reason = doc["reason"];
+  float targetLevel = doc["target_level"] | -1.0;
+  
+  if (!action) {
+    Serial.println("No action in pump command");
+    return;
+  }
+  
+  Serial.print("Processing pump command: ");
+  Serial.println(action);
+  
+  if (strcmp(action, "start") == 0) {
+    // Manual continuous start
+    if (pumpStatus.protectionActive) {
+      showMessageWithAutoReturn("PROTECTION ACTIVE");
+      return;
+    }
+    
+    setPumpState(true, reason ? reason : "API command - continuous start");
+    showMessageWithAutoReturn("API: PUMP ON");
+    
+  } else if (strcmp(action, "stop") == 0) {
+    // Manual stop
+    setPumpState(false, reason ? reason : "API command - stop");
+    showMessageWithAutoReturn("API: PUMP OFF");
+    
+  } else if (strcmp(action, "target") == 0) {
+    // Target mode
+    if (targetLevel > 0) {
+      char description[20];
+      sprintf(description, "API TARGET %.1f\"", targetLevel);
+      startTargetPumpOperation(targetLevel, description);
+    } else {
+      showMessageWithAutoReturn("API: INVALID TARGET");
+    }
+    
+  } else if (strcmp(action, "auto") == 0) {
+    // Enable auto mode
+    autoControlEnabled = true;
+    manualPumpControl = false;
+    if (targetModeActive) {
+      setPumpState(false, "API command - switched to auto mode");
+    }
+    showMessageWithAutoReturn("API: AUTO MODE");
+    
+  } else if (strcmp(action, "manual") == 0) {
+    // Enable manual mode
+    autoControlEnabled = false;
+    manualPumpControl = true;
+    showMessageWithAutoReturn("API: MANUAL MODE");
+  }
+}
