@@ -43,7 +43,6 @@
  #include <Update.h>
  #include <WebServer.h>
  #include <ESPAsyncWebServer.h>
- #include <AsyncElegantOTA.h>
  
  // ========================================
  // CONFIGURATION
