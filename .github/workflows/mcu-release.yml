@@ -10,6 +10,10 @@ on:
       - '.github/workflows/mcu-release.yml'
   workflow_dispatch:
 
+permissions:
+  contents: write
+  actions: read
+
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
@@ -36,7 +40,7 @@ jobs:
 
       - name: Build firmware (esp32dev)
         run: |
-          pio run -d ./mcu || pio run
+          pio run
         shell: bash
 
       - name: Locate firmware artifact
@@ -45,8 +49,6 @@ jobs:
           set -euo pipefail
           if [ -f ./.pio/build/esp32dev/firmware.bin ]; then
             echo "path=./.pio/build/esp32dev/firmware.bin" >> $GITHUB_OUTPUT
-          elif [ -f ./mcu/.pio/build/esp32dev/firmware.bin ]; then
-            echo "path=./mcu/.pio/build/esp32dev/firmware.bin" >> $GITHUB_OUTPUT
           else
             echo "Firmware bin not found" >&2
             ls -R . || true
@@ -59,23 +61,13 @@ jobs:
           TS=$(date +'%Y%m%d-%H%M%S')
           echo "tag=v0.0.${TS}" >> $GITHUB_OUTPUT
 
-      - name: Upload firmware to waterpump-backend release
+      - name: Create GitHub Release (this repo)
         env:
-          GH_TOKEN: ${{ secrets.FIRMWARE_RELEASE_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           TAG=${{ steps.tag.outputs.tag }}
           gh release create "$TAG" \
-            --repo msamoeed/waterpump-backend \
             --title "ESP32 Firmware $TAG" \
             --notes "Automated firmware build from MCU repo." \
-            ${{ steps.find_fw.outputs.path }}#firmware.bin
-
-      - name: Upload manifest.json (optional)
-        if: ${{ false }}
-        env:
-          GH_TOKEN: ${{ secrets.FIRMWARE_RELEASE_TOKEN }}
-        run: |
-          echo '{"min_version":"0.0.0","notes":"auto"}' > manifest.json
-          TAG=${{ steps.tag.outputs.tag }}
-          gh release upload "$TAG" manifest.json --repo msamoeed/waterpump-backend --clobber 
+            ${{ steps.find_fw.outputs.path }}#firmware.bin 

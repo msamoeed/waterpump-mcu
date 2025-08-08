@@ -65,7 +65,7 @@ const int WS_PORT = 3002;
 const char WS_URL[] = "/";
 
 // OTA Update Configuration
-const char GITHUB_REPO[] = "msamoeed/waterpump-backend";
+const char GITHUB_REPO[] = "msamoeed/waterpump-mcu";
 const char GITHUB_TOKEN[] = ""; // Optional: Add GitHub token for private repos
 
 // ========================================
