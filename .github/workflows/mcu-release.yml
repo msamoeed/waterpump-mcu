@@ -1,0 +1,81 @@
+name: MCU Firmware Release
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '**.ino'
+      - 'platformio.ini'
+      - 'lib/**'
+      - '.github/workflows/mcu-release.yml'
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout MCU repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-platformio-${{ hashFiles('**/platformio.ini') }}
+
+      - name: Build firmware (esp32dev)
+        run: |
+          pio run -d ./mcu || pio run
+        shell: bash
+
+      - name: Locate firmware artifact
+        id: find_fw
+        run: |
+          set -euo pipefail
+          if [ -f ./.pio/build/esp32dev/firmware.bin ]; then
+            echo "path=./.pio/build/esp32dev/firmware.bin" >> $GITHUB_OUTPUT
+          elif [ -f ./mcu/.pio/build/esp32dev/firmware.bin ]; then
+            echo "path=./mcu/.pio/build/esp32dev/firmware.bin" >> $GITHUB_OUTPUT
+          else
+            echo "Firmware bin not found" >&2
+            ls -R . || true
+            exit 1
+          fi
+
+      - name: Create release tag
+        id: tag
+        run: |
+          TS=$(date +'%Y%m%d-%H%M%S')
+          echo "tag=v0.0.${TS}" >> $GITHUB_OUTPUT
+
+      - name: Upload firmware to waterpump-backend release
+        env:
+          GH_TOKEN: ${{ secrets.FIRMWARE_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG=${{ steps.tag.outputs.tag }}
+          gh release create "$TAG" \
+            --repo msamoeed/waterpump-backend \
+            --title "ESP32 Firmware $TAG" \
+            --notes "Automated firmware build from MCU repo." \
+            ${{ steps.find_fw.outputs.path }}#firmware.bin
+
+      - name: Upload manifest.json (optional)
+        if: ${{ false }}
+        env:
+          GH_TOKEN: ${{ secrets.FIRMWARE_RELEASE_TOKEN }}
+        run: |
+          echo '{"min_version":"0.0.0","notes":"auto"}' > manifest.json
+          TAG=${{ steps.tag.outputs.tag }}
+          gh release upload "$TAG" manifest.json --repo msamoeed/waterpump-backend --clobber 

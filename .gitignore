@@ -1,0 +1,28 @@
+# PlatformIO build artifacts
+.pio/
+build/
+.cache/
+
+# IDE/editor
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Firmware outputs (if exported manually)
+firmware.bin
+*.bin
+*.elf
+*.map
+
+# Logs
+*.log
+
+# Local config/secrets (if you create them)
+.env
+.env.*
+secrets.h
+wifi_credentials.h 
