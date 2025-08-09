@@ -10,10 +10,29 @@ OLEDDisplay::OLEDDisplay() : initialized(false) {
 bool OLEDDisplay::initialize() {
     if (initialized) return true;
     
-    Wire.begin(SDA_PIN, SCL_PIN);
-    display->begin();
-    initialized = true;
+    // Check if display object was created successfully
+    if (!display) {
+        Serial.println("[HardwareAbstraction] OLED Display object creation failed");
+        return false;
+    }
     
+    // Initialize I2C with error checking
+    Wire.begin(SDA_PIN, SCL_PIN);
+    delay(100);  // Give I2C time to initialize
+    
+    // Initialize display with error handling
+    if (!display->begin()) {
+        Serial.println("[HardwareAbstraction] OLED Display begin() failed");
+        return false;
+    }
+    
+    // Clear display and test
+    display->clearBuffer();
+    display->setFont(u8g2_font_6x10_tf);
+    display->drawStr(0, 10, "Init OK");
+    display->sendBuffer();
+    
+    initialized = true;
     Serial.println("[HardwareAbstraction] OLED Display initialized");
     return true;
 }

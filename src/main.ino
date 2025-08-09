@@ -52,32 +52,47 @@
  // SETUP FUNCTION
  // ========================================
  void setup() {
-     Serial.begin(115200);
-     delay(1000);
-     
-         Serial.println("\n==================================================");
+    Serial.begin(115200);
+    delay(1000);
+    
+    Serial.println("\n==================================================");
     Serial.println("ESP32 Water Pump Controller v" + String(FIRMWARE_VERSION));
     Serial.println("Multi-Core Architecture");
     Serial.println("==================================================");
-     
-     // Initialize EEPROM first
-     initializeEEPROM();
-     
-     // Initialize core systems
-     if (!taskManager.initialize()) {
-         Serial.println("[SETUP] TaskManager initialization failed!");
-         while (true) delay(1000);
-     }
-     
-     if (!hardwareManager.initializeAll()) {
-         Serial.println("[SETUP] Hardware initialization failed!");
-         while (true) delay(1000);
-     }
-     
-     if (!commManager.initialize()) {
-         Serial.println("[SETUP] Communication initialization failed!");
-         // Continue without communication (local operation only)
-     }
+    
+    // Check available memory before starting
+    uint32_t freeHeap = ESP.getFreeHeap();
+    Serial.printf("[SETUP] Free heap at startup: %u bytes\n", freeHeap);
+    
+    if (freeHeap < 50000) {  // Require at least 50KB free
+        Serial.println("[SETUP] ERROR: Insufficient memory to start safely!");
+        while (true) delay(1000);
+    }
+    
+    // Initialize EEPROM first
+    initializeEEPROM();
+    
+    // Initialize core systems with error checking
+    Serial.println("[SETUP] Initializing TaskManager...");
+    if (!taskManager.initialize()) {
+        Serial.println("[SETUP] TaskManager initialization failed!");
+        while (true) delay(1000);
+    }
+    
+    Serial.println("[SETUP] Initializing Hardware...");
+    if (!hardwareManager.initializeAll()) {
+        Serial.println("[SETUP] Hardware initialization failed!");
+        while (true) delay(1000);
+    }
+    
+    // Give hardware time to stabilize
+    delay(500);
+    
+    Serial.println("[SETUP] Initializing Communication...");
+    if (!commManager.initialize()) {
+        Serial.println("[SETUP] Communication initialization failed!");
+        // Continue without communication (local operation only)
+    }
      
      // Set up OTA event handling
      commManager.setOTAEventCallback(handleOTAEvent);
@@ -118,33 +133,60 @@
  // MAIN LOOP (MINIMAL - RTOS HANDLES EVERYTHING)
  // ========================================
  void loop() {
-     // In the new architecture, most work is done by FreeRTOS tasks
-     // The main loop just handles system monitoring and emergency stops
-     
-     static unsigned long lastSystemCheck = 0;
-     unsigned long currentTime = millis();
-     
-     if (currentTime - lastSystemCheck >= 5000) { // Every 5 seconds
-         // System health check
-         if (taskManager.getFreeHeap() < 10000) { // Less than 10KB free
-             Serial.println("[MAIN] WARNING: Low memory!");
-             logMessage(LogLevel::WARN, "MAIN", "Low memory: " + String(taskManager.getFreeHeap()) + " bytes");
-         }
-         
-         // Emergency pump stop if critical error
-         if (taskManager.getMinimumFreeHeap() < 5000) { // Critical memory
-             if (hardwareManager.getPump() && hardwareManager.getPump()->isRunning()) {
-                 hardwareManager.getPump()->turnOff();
-                 logMessage(LogLevel::ERROR, "MAIN", "Emergency pump stop - Critical memory");
-             }
-         }
-         
-         lastSystemCheck = currentTime;
-     }
-     
-     // Small delay to prevent watchdog timeout
-     delay(100);
- }
+    // In the new architecture, most work is done by FreeRTOS tasks
+    // The main loop just handles system monitoring and emergency stops
+    
+    static unsigned long lastSystemCheck = 0;
+    static unsigned long lastMemoryCheck = 0;
+    static int criticalMemoryCount = 0;
+    unsigned long currentTime = millis();
+    
+    // Quick memory check every second
+    if (currentTime - lastMemoryCheck >= 1000) {
+        uint32_t freeHeap = taskManager.getFreeHeap();
+        
+        if (freeHeap < 5000) { // Critical memory
+            criticalMemoryCount++;
+            Serial.printf("[MAIN] CRITICAL: Memory very low: %u bytes (count: %d)\n", freeHeap, criticalMemoryCount);
+            
+            // Emergency pump stop
+            if (hardwareManager.getPump() && hardwareManager.getPump()->isRunning()) {
+                hardwareManager.getPump()->turnOff();
+                Serial.println("[MAIN] Emergency pump stop - Critical memory");
+            }
+            
+            // If memory is critical for too long, restart
+            if (criticalMemoryCount >= 10) {
+                Serial.println("[MAIN] EMERGENCY RESTART: Memory critically low for too long");
+                delay(1000);
+                ESP.restart();
+            }
+        } else {
+            criticalMemoryCount = 0; // Reset counter if memory is OK
+        }
+        
+        lastMemoryCheck = currentTime;
+    }
+    
+    if (currentTime - lastSystemCheck >= 5000) { // Every 5 seconds
+        // System health check
+        uint32_t freeHeap = taskManager.getFreeHeap();
+        uint32_t minFreeHeap = taskManager.getMinimumFreeHeap();
+        
+        Serial.printf("[MAIN] System Check - Free: %u, Min: %u, Uptime: %lus\n", 
+                     freeHeap, minFreeHeap, currentTime/1000);
+        
+        if (freeHeap < 15000) { // Less than 15KB free
+            Serial.println("[MAIN] WARNING: Low memory!");
+            logMessage(LogLevel::WARN, "MAIN", "Low memory: " + String(freeHeap) + " bytes");
+        }
+        
+        lastSystemCheck = currentTime;
+    }
+    
+    // Small delay to prevent watchdog timeout
+    delay(100);
+}
  
  // ========================================
  // INITIALIZATION FUNCTIONS
@@ -226,14 +268,29 @@
  // CORE 0 TASKS (COMMUNICATION)
  // ========================================
  extern "C" void communicationTask(void* parameters) {
-     Serial.println("[CommunicationTask] Started on core " + String(xPortGetCoreID()));
-     
-     TickType_t lastWakeTime = xTaskGetTickCount();
-     const TickType_t frequency = pdMS_TO_TICKS(100); // 100ms
-     
-     while (true) {
-         // Update communication components
-         commManager.update();
+    Serial.println("[CommunicationTask] Started on core " + String(xPortGetCoreID()));
+    
+    // Safety check - wait for hardware initialization
+    delay(1000);
+    
+    // Verify communication manager is initialized
+    if (!commManager.isConnected() && !commManager.isWiFiConnected()) {
+        Serial.println("[CommunicationTask] Warning: Communication not properly initialized");
+    }
+    
+    TickType_t lastWakeTime = xTaskGetTickCount();
+    const TickType_t frequency = pdMS_TO_TICKS(100); // 100ms
+    
+    while (true) {
+        // Check memory before operations
+        if (ESP.getFreeHeap() < 15000) {
+            Serial.println("[CommunicationTask] WARNING: Low memory, skipping update");
+            taskManager.delayMs(1000);
+            continue;
+        }
+        
+        // Update communication components safely
+        commManager.update();
          
          // Check for commands periodically
          static unsigned long lastCommandCheck = 0;
@@ -294,16 +351,32 @@
  // CORE 1 TASKS (CONTROL & DISPLAY)  
  // ========================================
  extern "C" void sensorTask(void* parameters) {
-     Serial.println("[SensorTask] Started on core " + String(xPortGetCoreID()));
-     
-     TickType_t lastWakeTime = xTaskGetTickCount();
-     const TickType_t frequency = pdMS_TO_TICKS(UPDATE_INTERVAL_SENSORS);
-     
-     while (true) {
-         // Read radio data
-         if (hardwareManager.getRadio() && hardwareManager.getRadio()->isAvailable()) {
-             WaterLevelData receivedData;
-             if (hardwareManager.getRadio()->read(&receivedData, sizeof(receivedData))) {
+    Serial.println("[SensorTask] Started on core " + String(xPortGetCoreID()));
+    
+    // Safety check - wait for hardware initialization
+    delay(1200);
+    
+    // Verify radio is initialized
+    if (!hardwareManager.getRadio()) {
+        Serial.println("[SensorTask] WARNING: Radio not initialized, continuing without radio data");
+    }
+    
+    TickType_t lastWakeTime = xTaskGetTickCount();
+    const TickType_t frequency = pdMS_TO_TICKS(UPDATE_INTERVAL_SENSORS);
+    
+    while (true) {
+        // Check memory before operations
+        if (ESP.getFreeHeap() < 12000) {
+            Serial.println("[SensorTask] WARNING: Low memory, delaying");
+            taskManager.delayMs(500);
+            continue;
+        }
+        
+                // Read radio data with null checks
+        auto radio = hardwareManager.getRadio();
+        if (radio != nullptr && radio->isAvailable()) {
+            WaterLevelData receivedData;
+            if (radio->read(&receivedData, sizeof(receivedData))) {
                  
                  if (taskManager.takeMutex(taskManager.getSystemMutex(), pdMS_TO_TICKS(10))) {
                      if (receivedData.tankID == 1) {
@@ -440,48 +513,73 @@
  }
  
  extern "C" void displayTask(void* parameters) {
-     Serial.println("[DisplayTask] Started on core " + String(xPortGetCoreID()));
-     
-     TickType_t lastWakeTime = xTaskGetTickCount();
-     const TickType_t frequency = pdMS_TO_TICKS(UPDATE_INTERVAL_DISPLAY);
-     
-     while (true) {
-         // Update non-blocking hardware (audio, RGB)
-         hardwareManager.updateNonBlockingHardware();
-         
-         // Process display updates
-         DisplayUpdate displayUpdate;
-                 if (xQueueReceive(taskManager.getDisplayUpdateQueue(), &displayUpdate, 0) == pdTRUE) {
-            if (displayUpdate.showMessage && hardwareManager.getDisplay()) {
-                hardwareManager.getDisplay()->clearBuffer();
-                hardwareManager.getDisplay()->drawStr(10, 30, displayUpdate.message.c_str());
-                hardwareManager.getDisplay()->sendBuffer();
+    Serial.println("[DisplayTask] Started on core " + String(xPortGetCoreID()));
+    
+    // Safety check - wait for hardware initialization
+    delay(1500);
+    
+    // Verify hardware manager and display are initialized
+    if (!hardwareManager.getDisplay()) {
+        Serial.println("[DisplayTask] ERROR: Display not initialized, task exiting");
+        vTaskDelete(nullptr);
+        return;
+    }
+    
+    TickType_t lastWakeTime = xTaskGetTickCount();
+    const TickType_t frequency = pdMS_TO_TICKS(UPDATE_INTERVAL_DISPLAY);
+    
+    while (true) {
+        // Check memory before operations
+        if (ESP.getFreeHeap() < 10000) {
+            Serial.println("[DisplayTask] WARNING: Low memory, delaying");
+            taskManager.delayMs(500);
+            continue;
+        }
+        
+        // Update non-blocking hardware safely
+        if (&hardwareManager != nullptr) {
+            hardwareManager.updateNonBlockingHardware();
+        }
+        
+        // Process display updates with null checks
+        DisplayUpdate displayUpdate;
+        if (xQueueReceive(taskManager.getDisplayUpdateQueue(), &displayUpdate, 0) == pdTRUE) {
+            if (displayUpdate.showMessage && hardwareManager.getDisplay() != nullptr) {
+                auto display = hardwareManager.getDisplay();
+                if (display != nullptr) {
+                    display->clearBuffer();
+                    display->drawStr(10, 30, displayUpdate.message.c_str());
+                    display->sendBuffer();
+                }
             }
         }
          
-         // Regular display update
-         if (hardwareManager.getDisplay() && 
-             taskManager.takeMutex(taskManager.getSystemMutex(), pdMS_TO_TICKS(10))) {
-             
-                         // Simple status display
-            hardwareManager.getDisplay()->clearBuffer();
+                 // Regular display update with enhanced safety checks
+        auto display = hardwareManager.getDisplay();
+        if (display != nullptr && 
+            taskManager.takeMutex(taskManager.getSystemMutex(), pdMS_TO_TICKS(10))) {
             
-            char buffer[32];
-             sprintf(buffer, "Ground: %.1f%%", g_groundTankData.levelPercent);
-             hardwareManager.getDisplay()->drawStr(5, 15, buffer);
-             
-             sprintf(buffer, "Roof: %.1f%%", g_roofTankData.levelPercent);
-             hardwareManager.getDisplay()->drawStr(5, 30, buffer);
-             
-             sprintf(buffer, "Pump: %s", g_pumpStatus.running ? "ON" : "OFF");
-             hardwareManager.getDisplay()->drawStr(5, 45, buffer);
-             
-             sprintf(buffer, "Mode: %s", g_systemState.autoControlEnabled ? "AUTO" : "MANUAL");
-             hardwareManager.getDisplay()->drawStr(5, 60, buffer);
-             
-             hardwareManager.getDisplay()->sendBuffer();
-             taskManager.giveMutex(taskManager.getSystemMutex());
-         }
+            // Simple status display with safe buffer operations
+            display->clearBuffer();
+            
+            char buffer[64];  // Increased buffer size for safety
+            memset(buffer, 0, sizeof(buffer));  // Clear buffer
+            
+            snprintf(buffer, sizeof(buffer)-1, "Ground: %.1f%%", g_groundTankData.levelPercent);
+            display->drawStr(5, 15, buffer);
+            
+            snprintf(buffer, sizeof(buffer)-1, "Roof: %.1f%%", g_roofTankData.levelPercent);
+            display->drawStr(5, 30, buffer);
+            
+            snprintf(buffer, sizeof(buffer)-1, "Pump: %s", g_pumpStatus.running ? "ON" : "OFF");
+            display->drawStr(5, 45, buffer);
+            
+            snprintf(buffer, sizeof(buffer)-1, "Mode: %s", g_systemState.autoControlEnabled ? "AUTO" : "MANUAL");
+            display->drawStr(5, 60, buffer);
+            
+            display->sendBuffer();
+            taskManager.giveMutex(taskManager.getSystemMutex());
+        }
          
          taskManager.feedWatchdog();
          vTaskDelayUntil(&lastWakeTime, frequency);

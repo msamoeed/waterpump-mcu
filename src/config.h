@@ -9,9 +9,9 @@
 // ========================================
 // FREERTOS CONFIGURATION
 // ========================================
-#define TASK_STACK_SIZE_SMALL     2048
-#define TASK_STACK_SIZE_MEDIUM    4096
-#define TASK_STACK_SIZE_LARGE     8192
+#define TASK_STACK_SIZE_SMALL     4096     // Increased from 2048
+#define TASK_STACK_SIZE_MEDIUM    8192     // Increased from 4096  
+#define TASK_STACK_SIZE_LARGE     16384    // Increased from 8192
 
 // Core assignments
 #define CORE_COMMUNICATION       0

@@ -60,6 +60,14 @@ bool TaskManager::createTask(const char* name, TaskFunction_t function, uint32_t
         return false;
     }
     
+    // Check available memory before creating task
+    uint32_t freeHeap = esp_get_free_heap_size();
+    if (freeHeap < (stackSize + 8192)) {  // Require task stack + 8KB overhead
+        Serial.printf("[TaskManager] Insufficient memory for task %s (need %u, have %u)\n", 
+                     name, stackSize + 8192, freeHeap);
+        return false;
+    }
+    
     TaskHandle_t handle;
     BaseType_t result;
     
@@ -71,7 +79,7 @@ bool TaskManager::createTask(const char* name, TaskFunction_t function, uint32_t
     }
     
     if (result != pdPASS) {
-        Serial.printf("[TaskManager] Failed to create task: %s\n", name);
+        Serial.printf("[TaskManager] Failed to create task: %s (error: %d)\n", name, result);
         return false;
     }
     
