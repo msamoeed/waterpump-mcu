@@ -15,7 +15,9 @@ TaskManager::TaskManager() : taskCount(0), initialized(false), systemStartTime(0
 
 TaskManager& TaskManager::getInstance() {
     if (instance == nullptr) {
-        instance = new TaskManager();
+        // Use static allocation to prevent heap fragmentation
+        static TaskManager staticInstance;
+        instance = &staticInstance;
     }
     return *instance;
 }

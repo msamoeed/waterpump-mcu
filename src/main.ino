@@ -16,14 +16,15 @@
  */
 
  #include <Arduino.h>
- #include <EEPROM.h>
- 
- // Core modules
- #include "config.h"
- #include "types.h"
- #include "core/TaskManager.h"
- #include "hardware/HardwareAbstraction.h"
- #include "communication/CommunicationManager.h"
+#include <EEPROM.h>
+#include "esp_heap_caps.h"
+
+// Core modules
+#include "config.h"
+#include "types.h"
+#include "core/TaskManager.h"
+#include "hardware/HardwareAbstraction.h"
+#include "communication/CommunicationManager.h"
  
  // ========================================
  // GLOBAL MANAGERS (SINGLETONS)
@@ -56,7 +57,7 @@
     delay(1000);
     
     Serial.println("\n==================================================");
-    Serial.println("ESP32 Water Pump Controller v" + String(FIRMWARE_VERSION));
+    Serial.printf("ESP32 Water Pump Controller v%s\n", FIRMWARE_VERSION);
     Serial.println("Multi-Core Architecture");
     Serial.println("==================================================");
     
@@ -116,14 +117,26 @@
          hardwareManager.getAudio()->playBeep(200);
      }
      
-     // Start all tasks (this will create and start the FreeRTOS tasks)
-     taskManager.startAllTasks();
-     
-     logMessage(LogLevel::INFO, "STARTUP", "System initialization complete");
-     
-     Serial.println("[SETUP] System ready! Tasks started on both cores.");
-     Serial.println("[SETUP] Core 0: Communication, OTA, Logging");
-     Serial.println("[SETUP] Core 1: Control, Sensors, Display");
+         // Enable heap corruption detection
+    ESP_ERROR_CHECK(heap_caps_check_integrity(MALLOC_CAP_DEFAULT, true));
+    
+    // Final memory check before starting tasks
+    uint32_t freeBeforeTasks = ESP.getFreeHeap();
+    Serial.printf("[SETUP] Free heap before tasks: %u bytes\n", freeBeforeTasks);
+    
+    // Start all tasks (this will create and start the FreeRTOS tasks)
+    taskManager.startAllTasks();
+    
+    // Check memory after task creation
+    uint32_t freeAfterTasks = ESP.getFreeHeap();
+    Serial.printf("[SETUP] Free heap after tasks: %u bytes (used: %u)\n", 
+                 freeAfterTasks, freeBeforeTasks - freeAfterTasks);
+    
+    logMessage(LogLevel::INFO, "STARTUP", "System initialization complete");
+    
+    Serial.println("[SETUP] System ready! Tasks started on both cores.");
+    Serial.println("[SETUP] Core 0: Communication, OTA, Logging");
+    Serial.println("[SETUP] Core 1: Control, Sensors, Display");
      
      // The main loop will now be handled by FreeRTOS tasks
      // This setup() function completes and Arduino's loop() becomes minimal
@@ -176,9 +189,23 @@
         Serial.printf("[MAIN] System Check - Free: %u, Min: %u, Uptime: %lus\n", 
                      freeHeap, minFreeHeap, currentTime/1000);
         
+        // Check heap integrity
+        if (!heap_caps_check_integrity(MALLOC_CAP_DEFAULT, false)) {
+            Serial.println("[MAIN] CRITICAL: Heap corruption detected!");
+            // Try to recover or restart
+            delay(100);
+            if (!heap_caps_check_integrity(MALLOC_CAP_DEFAULT, false)) {
+                Serial.println("[MAIN] EMERGENCY RESTART: Heap corruption persists");
+                delay(1000);
+                ESP.restart();
+            }
+        }
+        
         if (freeHeap < 15000) { // Less than 15KB free
             Serial.println("[MAIN] WARNING: Low memory!");
-            logMessage(LogLevel::WARN, "MAIN", "Low memory: " + String(freeHeap) + " bytes");
+            char logMsg[64];
+            snprintf(logMsg, sizeof(logMsg), "Low memory: %u bytes", freeHeap);
+            logMessage(LogLevel::WARN, "MAIN", String(logMsg));
         }
         
         lastSystemCheck = currentTime;
@@ -196,7 +223,7 @@
          Serial.println("[EEPROM] Initialization failed!");
          return;
      }
-     Serial.println("[EEPROM] Initialized (" + String(EEPROM_SIZE) + " bytes)");
+     Serial.printf("[EEPROM] Initialized (%d bytes)\n", EEPROM_SIZE);
  }
  
  // ========================================
@@ -268,7 +295,7 @@
  // CORE 0 TASKS (COMMUNICATION)
  // ========================================
  extern "C" void communicationTask(void* parameters) {
-    Serial.println("[CommunicationTask] Started on core " + String(xPortGetCoreID()));
+    Serial.printf("[CommunicationTask] Started on core %d\n", xPortGetCoreID());
     
     // Safety check - wait for hardware initialization
     delay(1000);
@@ -320,7 +347,7 @@
  }
  
  extern "C" void loggerTask(void* parameters) {
-     Serial.println("[LoggerTask] Started on core " + String(xPortGetCoreID()));
+    Serial.printf("[LoggerTask] Started on core %d\n", xPortGetCoreID());
      
      LogEntry logBuffer[LOG_BATCH_MAX];
      size_t logCount = 0;
@@ -351,7 +378,7 @@
  // CORE 1 TASKS (CONTROL & DISPLAY)  
  // ========================================
  extern "C" void sensorTask(void* parameters) {
-    Serial.println("[SensorTask] Started on core " + String(xPortGetCoreID()));
+    Serial.printf("[SensorTask] Started on core %d\n", xPortGetCoreID());
     
     // Safety check - wait for hardware initialization
     delay(1200);
@@ -422,7 +449,7 @@
  }
  
  extern "C" void pumpControlTask(void* parameters) {
-     Serial.println("[PumpControlTask] Started on core " + String(xPortGetCoreID()));
+    Serial.printf("[PumpControlTask] Started on core %d\n", xPortGetCoreID());
      
      TickType_t lastWakeTime = xTaskGetTickCount();
      const TickType_t frequency = pdMS_TO_TICKS(UPDATE_INTERVAL_PUMP);
@@ -513,7 +540,7 @@
  }
  
  extern "C" void displayTask(void* parameters) {
-    Serial.println("[DisplayTask] Started on core " + String(xPortGetCoreID()));
+    Serial.printf("[DisplayTask] Started on core %d\n", xPortGetCoreID());
     
     // Safety check - wait for hardware initialization
     delay(1500);
@@ -587,7 +614,7 @@
  }
  
  extern "C" void otaTask(void* parameters) {
-     Serial.println("[OTATask] Started on core " + String(xPortGetCoreID()));
+    Serial.printf("[OTATask] Started on core %d\n", xPortGetCoreID());
      
      while (true) {
          // OTA handling logic would go here
@@ -599,7 +626,7 @@
  }
  
  extern "C" void systemMonitorTask(void* parameters) {
-     Serial.println("[SystemMonitorTask] Started on core " + String(xPortGetCoreID()));
+    Serial.printf("[SystemMonitorTask] Started on core %d\n", xPortGetCoreID());
      
      while (true) {
          // Print system statistics every 30 seconds

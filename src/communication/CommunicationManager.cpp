@@ -97,12 +97,15 @@ bool BackendHTTPClient::sendPumpEvent(const String& eventType, const String& rea
 bool BackendHTTPClient::sendLogs(const LogEntry* logs, size_t count) {
     String payload = buildLogsPayload(logs, count);
     String response;
-    return sendRequest("/devices/" + String(DEVICE_ID) + "/logs", payload, response);
+    char endpoint[128];
+    snprintf(endpoint, sizeof(endpoint), "/devices/%s/logs", DEVICE_ID);
+    return sendRequest(endpoint, payload, response);
 }
 
 bool BackendHTTPClient::checkForCommands(CommandMessage& command) {
     String response;
-    String endpoint = "/devices/pump/command/" + String(DEVICE_ID);
+    char endpoint[128];
+    snprintf(endpoint, sizeof(endpoint), "/devices/pump/command/%s", DEVICE_ID);
     
     if (sendRequest(endpoint, "", response)) {
         if (response.length() > 0 && response != "null") {
@@ -132,7 +135,8 @@ bool BackendHTTPClient::checkForCommands(CommandMessage& command) {
 
 bool BackendHTTPClient::getOTAInfo(OTAStatus& otaStatus) {
     String response;
-    String endpoint = "/devices/" + String(DEVICE_ID) + "/ota/latest";
+    char endpoint[128];
+    snprintf(endpoint, sizeof(endpoint), "/devices/%s/ota/latest", DEVICE_ID);
     
     if (sendRequest(endpoint, "", response)) {
         DynamicJsonDocument doc(1024);
@@ -241,7 +245,8 @@ bool BackendHTTPClient::sendRequest(const String& endpoint, const String& payloa
         return false;
     }
     
-    String url = String("http://") + BACKEND_HOST + ":" + BACKEND_PORT + API_BASE_URL + endpoint;
+    char url[256];
+    snprintf(url, sizeof(url), "http://%s:%d%s%s", BACKEND_HOST, BACKEND_PORT, API_BASE_URL, endpoint);
     
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
@@ -374,7 +379,7 @@ void WebSocketClient::handleSocketEvent(socketIOmessageType_t type, uint8_t* pay
             DynamicJsonDocument doc(128);
             JsonArray array = doc.to<JsonArray>();
             array.add("subscribe_device");
-            array.add(String(DEVICE_ID));
+            array.add(DEVICE_ID);
             String message;
             serializeJson(doc, message);
             socketIO.sendEVENT(message);
@@ -412,7 +417,9 @@ CommunicationManager::CommunicationManager() : initialized(false), lastStatusUpd
 
 CommunicationManager& CommunicationManager::getInstance() {
     if (instance == nullptr) {
-        instance = new CommunicationManager();
+        // Use static allocation to prevent heap fragmentation
+        static CommunicationManager staticInstance;
+        instance = &staticInstance;
     }
     return *instance;
 }

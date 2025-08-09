@@ -440,7 +440,9 @@ HardwareManager::HardwareManager() : initialized(false) {
 
 HardwareManager& HardwareManager::getInstance() {
     if (instance == nullptr) {
-        instance = new HardwareManager();
+        // Use static allocation to prevent heap fragmentation
+        static HardwareManager staticInstance;
+        instance = &staticInstance;
     }
     return *instance;
 }
