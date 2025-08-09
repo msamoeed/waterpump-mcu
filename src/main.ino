@@ -341,6 +341,13 @@ const unsigned long COMMAND_CHECK_INTERVAL = 5000;  // Check every 5 seconds
 unsigned long lastManualCommandTime = 0;
 const unsigned long MANUAL_COMMAND_OVERRIDE_DURATION = 30000;  // 30 seconds override
 
+// Centralized motor control variables
+unsigned long lastMotorHeartbeat = 0;
+const unsigned long MOTOR_HEARTBEAT_INTERVAL = 15000;  // Send heartbeat every 15 seconds
+unsigned long lastMotorStateSync = 0;
+const unsigned long MOTOR_STATE_SYNC_INTERVAL = 60000;  // Sync state every minute
+bool motorStateInitialized = false;
+
 // ========================================
 // OTA UPDATE VARIABLES
 // ========================================
@@ -2076,7 +2083,13 @@ void setup() {
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
   
-  Serial.println("Setup complete - Enhanced pump control ready!");
+  // Initial motor state sync after everything is ready
+  Serial.println("Performing initial motor state sync...");
+  delay(2000); // Wait for systems to stabilize
+  syncMotorStateWithBackend();
+  motorStateInitialized = true;
+  
+  Serial.println("Setup complete - Centralized motor control ready!");
 }
 
 // ========================================
@@ -2109,8 +2122,27 @@ void loop() {
   // Background operations
   updateBackendVariablesBackground();
   
-  // Check for pump commands
-  checkForPumpCommands();
+  // Centralized motor control system
+  if (motorStateInitialized) {
+    // Send motor heartbeat periodically
+    unsigned long currentTime = millis();
+    if (currentTime - lastMotorHeartbeat >= MOTOR_HEARTBEAT_INTERVAL) {
+      sendMotorHeartbeat();
+      lastMotorHeartbeat = currentTime;
+    }
+    
+    // Sync motor state periodically
+    if (currentTime - lastMotorStateSync >= MOTOR_STATE_SYNC_INTERVAL) {
+      syncMotorStateWithBackend();
+      lastMotorStateSync = currentTime;
+    }
+    
+    // Check for motor commands
+    checkForMotorCommands();
+  }
+  
+  // Legacy pump commands (for backward compatibility)
+  // checkForPumpCommands();
   
   // Handle WebSocket events
   webSocket.loop();
@@ -2144,7 +2176,292 @@ void loop() {
 }
 
 // ========================================
-// COMMAND PROCESSING FUNCTIONS
+// CENTRALIZED MOTOR CONTROL FUNCTIONS
+// ========================================
+void syncMotorStateWithBackend() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected, skipping motor state sync");
+    return;
+  }
+  
+  String url = String("http://") + BACKEND_HOST + ":" + BACKEND_PORT + API_BASE_URL + "/motor/state/" + DEVICE_ID;
+  
+  Serial.print("Syncing motor state from: ");
+  Serial.println(url);
+  
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  
+  int httpResponseCode = http.GET();
+  
+  if (httpResponseCode == 200) {
+    String payload = http.getString();
+    Serial.print("Received motor state: ");
+    Serial.println(payload);
+    
+    DynamicJsonDocument doc(1024);
+    DeserializationError error = deserializeJson(doc, payload);
+    
+    if (!error && doc["success"].as<bool>()) {
+      JsonObject data = doc["data"];
+      
+      // Sync local state with backend state
+      bool backendMotorRunning = data["motorRunning"] | false;
+      String backendControlMode = data["controlMode"] | "auto";
+      bool backendTargetActive = data["targetModeActive"] | false;
+      float backendTargetLevel = data["currentTargetLevel"] | 0.0;
+      String backendTargetDesc = data["targetDescription"] | "";
+      bool backendProtectionActive = data["protectionActive"] | false;
+      
+      Serial.print("Backend state - Motor: ");
+      Serial.print(backendMotorRunning ? "ON" : "OFF");
+      Serial.print(", Mode: ");
+      Serial.print(backendControlMode);
+      Serial.print(", Target: ");
+      Serial.print(backendTargetActive ? "ACTIVE" : "INACTIVE");
+      Serial.print(", Protection: ");
+      Serial.println(backendProtectionActive ? "ACTIVE" : "INACTIVE");
+      
+      // Update local state to match backend
+      autoControlEnabled = (backendControlMode == "auto");
+      manualPumpControl = (backendControlMode == "manual");
+      targetModeActive = backendTargetActive;
+      currentTargetLevel = backendTargetLevel;
+      targetDescription = backendTargetDesc;
+      pumpStatus.protectionActive = backendProtectionActive;
+      
+      // Only change pump state if there's a significant difference
+      if (pumpState != backendMotorRunning) {
+        Serial.print("Motor state mismatch - Local: ");
+        Serial.print(pumpState ? "ON" : "OFF");
+        Serial.print(", Backend: ");
+        Serial.println(backendMotorRunning ? "ON" : "OFF");
+        
+        // Update pump state to match backend
+        setPumpState(backendMotorRunning, "Backend state sync");
+      }
+      
+      Serial.println("Motor state sync completed");
+    } else {
+      Serial.println("Failed to parse motor state response");
+    }
+  } else {
+    Serial.print("Failed to get motor state, HTTP code: ");
+    Serial.println(httpResponseCode);
+  }
+  
+  http.end();
+}
+
+void sendMotorHeartbeat() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  
+  DynamicJsonDocument doc(512);
+  doc["device_id"] = DEVICE_ID;
+  doc["motor_running"] = pumpState;
+  doc["control_mode"] = autoControlEnabled ? "auto" : "manual";
+  doc["target_mode_active"] = targetModeActive;
+  doc["current_target_level"] = currentTargetLevel;
+  doc["target_description"] = targetDescription;
+  doc["protection_active"] = pumpStatus.protectionActive;
+  doc["current_amps"] = pumpStatus.currentAmps;
+  doc["power_watts"] = pumpStatus.powerWatts;
+  doc["runtime_minutes"] = pumpStatus.runTimeMinutes;
+  doc["total_runtime_hours"] = pumpStatus.totalRunTimeHours;
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  String url = String("http://") + BACKEND_HOST + ":" + BACKEND_PORT + API_BASE_URL + "/motor/heartbeat";
+  
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  
+  int httpResponseCode = http.POST(jsonString);
+  
+  if (httpResponseCode > 0) {
+    Serial.print("Motor heartbeat sent, response: ");
+    Serial.println(httpResponseCode);
+  } else {
+    Serial.print("Motor heartbeat failed, error: ");
+    Serial.println(httpResponseCode);
+  }
+  
+  http.end();
+}
+
+String currentCommandId = "";
+
+void checkForMotorCommands() {
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastCommandCheck >= COMMAND_CHECK_INTERVAL) {
+    if (WiFi.status() == WL_CONNECTED) {
+      String url = String("http://") + BACKEND_HOST + ":" + BACKEND_PORT + API_BASE_URL + "/motor/command/" + DEVICE_ID;
+      
+      Serial.print("Checking for motor commands at: ");
+      Serial.println(url);
+      
+      http.begin(url);
+      http.addHeader("Content-Type", "application/json");
+      
+      int httpResponseCode = http.GET();
+      
+      if (httpResponseCode == 200) {
+        String payload = http.getString();
+        Serial.print("Received command payload: ");
+        Serial.println(payload);
+        
+        if (payload.length() > 0 && payload != "null" && !payload.startsWith("{\"message\"")) {
+          Serial.println("Processing motor command...");
+          processMotorCommand(payload);
+        } else {
+          Serial.println("No pending motor commands");
+        }
+      } else {
+        Serial.print("Motor command check failed with code: ");
+        Serial.println(httpResponseCode);
+      }
+      
+      http.end();
+    }
+    
+    lastCommandCheck = currentTime;
+  }
+}
+
+void processMotorCommand(const String& commandJson) {
+  Serial.println("=== PROCESSING MOTOR COMMAND ===");
+  Serial.print("Raw JSON: ");
+  Serial.println(commandJson);
+  
+  DynamicJsonDocument doc(512);
+  DeserializationError error = deserializeJson(doc, commandJson);
+  
+  if (error) {
+    Serial.print("Failed to parse motor command JSON: ");
+    Serial.println(error.c_str());
+    acknowledgeCommand("", false, "JSON parse error");
+    return;
+  }
+  
+  const char* action = doc["action"];
+  const char* reason = doc["reason"];
+  float targetLevel = doc["target_level"] | -1.0;
+  currentCommandId = doc["command_id"] | "";
+  const char* source = doc["source"] | "unknown";
+  
+  Serial.print("Command ID: ");
+  Serial.println(currentCommandId);
+  Serial.print("Action: ");
+  Serial.println(action ? action : "NULL");
+  Serial.print("Source: ");
+  Serial.println(source);
+  Serial.print("Reason: ");
+  Serial.println(reason ? reason : "NULL");
+  
+  if (!action) {
+    Serial.println("No action in motor command");
+    acknowledgeCommand(currentCommandId, false, "No action specified");
+    return;
+  }
+  
+  bool commandSuccess = true;
+  String errorMessage = "";
+  
+  if (strcmp(action, "start") == 0) {
+    Serial.println("Executing START command");
+    if (pumpStatus.protectionActive) {
+      showMessageWithAutoReturn("PROTECTION ACTIVE");
+      commandSuccess = false;
+      errorMessage = "Protection system active";
+    } else {
+      setPumpState(true, reason ? reason : "Motor command - start");
+      showMessageWithAutoReturn("MOTOR: ON");
+    }
+    
+  } else if (strcmp(action, "stop") == 0) {
+    Serial.println("Executing STOP command");
+    setPumpState(false, reason ? reason : "Motor command - stop");
+    showMessageWithAutoReturn("MOTOR: OFF");
+    
+  } else if (strcmp(action, "target") == 0) {
+    Serial.println("Executing TARGET command");
+    if (targetLevel > 0) {
+      char description[20];
+      sprintf(description, "TARGET %.1f\"", targetLevel);
+      startTargetPumpOperation(targetLevel, description);
+    } else {
+      showMessageWithAutoReturn("INVALID TARGET");
+      commandSuccess = false;
+      errorMessage = "Invalid target level";
+    }
+    
+  } else if (strcmp(action, "auto") == 0) {
+    Serial.println("Executing AUTO command");
+    autoControlEnabled = true;
+    manualPumpControl = false;
+    if (targetModeActive) {
+      setPumpState(false, "Motor command - switched to auto mode");
+    }
+    showMessageWithAutoReturn("AUTO MODE");
+    
+  } else if (strcmp(action, "manual") == 0) {
+    Serial.println("Executing MANUAL command");
+    autoControlEnabled = false;
+    manualPumpControl = true;
+    showMessageWithAutoReturn("MANUAL MODE");
+    
+  } else if (strcmp(action, "reset_protection") == 0) {
+    Serial.println("Executing RESET_PROTECTION command");
+    clearProtectionSystem();
+    showMessageWithAutoReturn("PROTECTION RESET");
+    
+  } else {
+    Serial.print("Unknown action: ");
+    Serial.println(action);
+    commandSuccess = false;
+    errorMessage = "Unknown action";
+  }
+  
+  // Acknowledge command execution
+  acknowledgeCommand(currentCommandId, commandSuccess, errorMessage);
+  
+  Serial.println("=== MOTOR COMMAND PROCESSING COMPLETE ===");
+}
+
+void acknowledgeCommand(const String& commandId, bool success, const String& errorMessage) {
+  if (WiFi.status() != WL_CONNECTED || commandId.length() == 0) {
+    return;
+  }
+  
+  DynamicJsonDocument doc(256);
+  doc["command_id"] = commandId;
+  doc["success"] = success;
+  if (!success && errorMessage.length() > 0) {
+    doc["error_message"] = errorMessage;
+  }
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  String url = String("http://") + BACKEND_HOST + ":" + BACKEND_PORT + API_BASE_URL + "/motor/command/" + DEVICE_ID + "/acknowledge";
+  
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  
+  int httpResponseCode = http.POST(jsonString);
+  
+  Serial.print("Command acknowledgment sent, response: ");
+  Serial.println(httpResponseCode);
+  
+  http.end();
+}
+
+// ========================================
+// LEGACY COMMAND PROCESSING FUNCTIONS (DEPRECATED)
 // ========================================
 void checkForPumpCommands() {
   unsigned long currentTime = millis();
@@ -2362,7 +2679,7 @@ void handleOTAUpdateComplete(JsonDocument& doc) {
     Serial.print("OTA update completed successfully: ");
     Serial.println(version);
     showMessageNonBlocking("OTA UPDATE COMPLETE");
-    playBeepNonBlocking(300);
+    playBeepNonBlocking(255);
   } else {
     String error = doc["error"] | "";
     Serial.print("OTA update failed: ");
