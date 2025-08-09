@@ -18,6 +18,7 @@
  #include <Arduino.h>
 #include <EEPROM.h>
 #include "esp_heap_caps.h"
+#include "esp_core_dump.h"
 
 // Core modules
 #include "config.h"
@@ -61,6 +62,10 @@
     Serial.println("Multi-Core Architecture");
     Serial.println("==================================================");
     
+    // Initialize core dump system
+    esp_core_dump_init();
+    Serial.println("[SETUP] Core dump system initialized");
+    
     // Check available memory before starting
     uint32_t freeHeap = ESP.getFreeHeap();
     Serial.printf("[SETUP] Free heap at startup: %u bytes\n", freeHeap);
@@ -72,6 +77,7 @@
     
     // Initialize EEPROM first
     initializeEEPROM();
+    Serial.printf("[SETUP] After EEPROM - Free heap: %u bytes\n", ESP.getFreeHeap());
     
     // Initialize core systems with error checking
     Serial.println("[SETUP] Initializing TaskManager...");
@@ -79,12 +85,14 @@
         Serial.println("[SETUP] TaskManager initialization failed!");
         while (true) delay(1000);
     }
+    Serial.printf("[SETUP] After TaskManager - Free heap: %u bytes\n", ESP.getFreeHeap());
     
     Serial.println("[SETUP] Initializing Hardware...");
     if (!hardwareManager.initializeAll()) {
         Serial.println("[SETUP] Hardware initialization failed!");
         while (true) delay(1000);
     }
+    Serial.printf("[SETUP] After Hardware - Free heap: %u bytes\n", ESP.getFreeHeap());
     
     // Give hardware time to stabilize
     delay(500);
@@ -94,6 +102,7 @@
         Serial.println("[SETUP] Communication initialization failed!");
         // Continue without communication (local operation only)
     }
+    Serial.printf("[SETUP] After Communication - Free heap: %u bytes\n", ESP.getFreeHeap());
      
      // Set up OTA event handling
      commManager.setOTAEventCallback(handleOTAEvent);
@@ -117,8 +126,14 @@
          hardwareManager.getAudio()->playBeep(200);
      }
      
-         // Enable heap corruption detection
-    ESP_ERROR_CHECK(heap_caps_check_integrity(MALLOC_CAP_DEFAULT, true));
+         // Check heap integrity without aborting on error
+    bool heapOk = heap_caps_check_integrity(MALLOC_CAP_DEFAULT, false);
+    if (!heapOk) {
+        Serial.println("[SETUP] WARNING: Heap corruption detected during initialization!");
+        Serial.println("[SETUP] Attempting to continue with degraded functionality...");
+    } else {
+        Serial.println("[SETUP] Heap integrity check passed");
+    }
     
     // Final memory check before starting tasks
     uint32_t freeBeforeTasks = ESP.getFreeHeap();

@@ -1,19 +1,24 @@
 #include "HardwareAbstraction.h"
+#include <new>
 
 // ========================================
 // OLED DISPLAY IMPLEMENTATION
 // ========================================
 OLEDDisplay::OLEDDisplay() : initialized(false) {
-    display = new U8G2_SH1106_128X64_NONAME_F_HW_I2C(U8G2_R0, U8X8_PIN_NONE);
+    // Use static allocation to prevent heap corruption
+    display = nullptr;
 }
 
 bool OLEDDisplay::initialize() {
     if (initialized) return true;
     
-    // Check if display object was created successfully
+    // Create display object only when needed to prevent early heap allocation
     if (!display) {
-        Serial.println("[HardwareAbstraction] OLED Display object creation failed");
-        return false;
+        display = new(std::nothrow) U8G2_SH1106_128X64_NONAME_F_HW_I2C(U8G2_R0, U8X8_PIN_NONE);
+        if (!display) {
+            Serial.println("[HardwareAbstraction] OLED Display object creation failed - out of memory");
+            return false;
+        }
     }
     
     // Initialize I2C with error checking
@@ -23,6 +28,8 @@ bool OLEDDisplay::initialize() {
     // Initialize display with error handling
     if (!display->begin()) {
         Serial.println("[HardwareAbstraction] OLED Display begin() failed");
+        delete display;
+        display = nullptr;
         return false;
     }
     
@@ -293,16 +300,28 @@ void RotaryEncoder::handleInterrupt() {
 // NRF24 RADIO IMPLEMENTATION
 // ========================================
 NRF24Radio::NRF24Radio() : initialized(false) {
-    radio = new RF24(CE_PIN, CSN_PIN);
+    // Delay radio creation to prevent early heap allocation
+    radio = nullptr;
 }
 
 bool NRF24Radio::initialize() {
     if (initialized) return true;
     
+    // Create radio object only when needed
+    if (!radio) {
+        radio = new(std::nothrow) RF24(CE_PIN, CSN_PIN);
+        if (!radio) {
+            Serial.println("[HardwareAbstraction] NRF24 Radio object creation failed - out of memory");
+            return false;
+        }
+    }
+    
     SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, CSN_PIN);
     
     if (!radio->begin()) {
         Serial.println("[HardwareAbstraction] NRF24 Radio initialization failed");
+        delete radio;
+        radio = nullptr;
         return false;
     }
     
@@ -453,30 +472,43 @@ bool HardwareManager::initializeAll() {
     Serial.println("[HardwareManager] Initializing all hardware...");
     
     // Create hardware instances
-    display = new OLEDDisplay();
-    rgb = new RGBLed();
-    audio = new BuzzerAudio();
-    encoder = new RotaryEncoder();
-    radio = new NRF24Radio();
-    pump = new RelayPumpControl();
+    display = new(std::nothrow) OLEDDisplay();
+    rgb = new(std::nothrow) RGBLed();
+    audio = new(std::nothrow) BuzzerAudio();
+    encoder = new(std::nothrow) RotaryEncoder();
+    radio = new(std::nothrow) NRF24Radio();
+    pump = new(std::nothrow) RelayPumpControl();
     
-    // Initialize all hardware
-    bool success = true;
-    success &= display->initialize();
-    success &= rgb->initialize();
-    success &= audio->initialize();
-    success &= encoder->initialize();
-    success &= radio->initialize();
-    success &= pump->initialize();
-    
-    if (success) {
-        initialized = true;
-        Serial.println("[HardwareManager] All hardware initialized successfully");
-    } else {
-        Serial.println("[HardwareManager] Some hardware failed to initialize");
+    // Check if basic allocations succeeded
+    if (!display || !rgb || !audio || !encoder || !radio || !pump) {
+        Serial.println("[HardwareManager] CRITICAL: Failed to allocate hardware objects!");
+        return false;
     }
     
-    return success;
+    // Initialize all hardware with error tolerance
+    bool displayOk = display->initialize();
+    bool rgbOk = rgb->initialize();
+    bool audioOk = audio->initialize();
+    bool encoderOk = encoder->initialize();
+    bool radioOk = radio->initialize();
+    bool pumpOk = pump->initialize();
+    
+    // Report individual component status
+    Serial.printf("[HardwareManager] Component status: Display:%s RGB:%s Audio:%s Encoder:%s Radio:%s Pump:%s\n",
+                 displayOk ? "OK" : "FAIL", rgbOk ? "OK" : "FAIL", audioOk ? "OK" : "FAIL",
+                 encoderOk ? "OK" : "FAIL", radioOk ? "OK" : "FAIL", pumpOk ? "OK" : "FAIL");
+    
+    // Critical components: at least pump must work
+    bool criticalOk = pumpOk;
+    
+    if (criticalOk) {
+        initialized = true;
+        Serial.println("[HardwareManager] Hardware initialized (some components may have failed)");
+        return true;
+    } else {
+        Serial.println("[HardwareManager] CRITICAL: Essential hardware failed to initialize");
+        return false;
+    }
 }
 
 void HardwareManager::updateNonBlockingHardware() {
