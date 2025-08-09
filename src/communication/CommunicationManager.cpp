@@ -245,28 +245,65 @@ bool BackendHTTPClient::sendRequest(const String& endpoint, const String& payloa
         return false;
     }
     
-    char url[256];
-    snprintf(url, sizeof(url), "http://%s:%d%s%s", BACKEND_HOST, BACKEND_PORT, API_BASE_URL, endpoint);
+    // Check available memory before HTTP operation
+    uint32_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < 8192) {  // Need at least 8KB for HTTP operations
+        Serial.printf("[HTTPClient] Insufficient memory for HTTP request: %u bytes\n", freeHeap);
+        status.connected = false;
+        return false;
+    }
     
-    http.begin(url);
+    char url[256];
+    int urlLen = snprintf(url, sizeof(url), "http://%s:%d%s%s", BACKEND_HOST, BACKEND_PORT, API_BASE_URL, endpoint);
+    if (urlLen >= sizeof(url)) {
+        Serial.println("[HTTPClient] URL too long, truncated");
+        status.connected = false;
+        return false;
+    }
+    
+    // Initialize HTTP client safely
+    if (!http.begin(url)) {
+        Serial.println("[HTTPClient] Failed to begin HTTP connection");
+        status.connected = false;
+        return false;
+    }
+    
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(BACKEND_TIMEOUT);
     
-    int httpResponseCode;
+    int httpResponseCode = -1;
+    
+    // Perform HTTP request with error handling
     if (payload.isEmpty()) {
         httpResponseCode = http.GET();
     } else {
+        if (payload.length() > 2048) {  // Limit payload size
+            Serial.println("[HTTPClient] Payload too large, rejecting request");
+            http.end();
+            return false;
+        }
         httpResponseCode = http.POST(payload);
     }
     
     if (httpResponseCode > 0) {
+        // Limit response size to prevent memory issues
+        int contentLength = http.getSize();
+        if (contentLength > 4096) {
+            Serial.printf("[HTTPClient] Response too large (%d bytes), truncating\n", contentLength);
+        }
+        
         response = http.getString();
+        if (response.length() > 4096) {
+            response = response.substring(0, 4096);  // Truncate if too large
+        }
+        
         status.connected = true;
         status.lastResponse = millis();
         status.errorCount = 0;
         http.end();
         return true;
     } else {
+        Serial.printf("[HTTPClient] HTTP request failed with code: %d\n", httpResponseCode);
         status.connected = false;
         status.errorCount++;
         http.end();
@@ -429,24 +466,30 @@ bool CommunicationManager::initialize() {
     
     Serial.println("[CommunicationManager] Initializing...");
     
-    // Create communication components
-    wifiManager = new WiFiManager();
-    httpClient = new BackendHTTPClient();
-    webSocketClient = new WebSocketClient();
+    // Create communication components with safe allocation
+    wifiManager = new(std::nothrow) WiFiManager();
+    httpClient = new(std::nothrow) BackendHTTPClient();
+    webSocketClient = new(std::nothrow) WebSocketClient();
     
-    // Initialize components
-    bool success = true;
-    success &= wifiManager->initialize();
-    success &= webSocketClient->initialize();
-    
-    if (success) {
-        initialized = true;
-        Serial.println("[CommunicationManager] Initialization complete");
-    } else {
-        Serial.println("[CommunicationManager] Initialization failed");
+    // Check if allocations succeeded
+    if (!wifiManager || !httpClient || !webSocketClient) {
+        Serial.println("[CommunicationManager] CRITICAL: Failed to allocate communication objects!");
+        return false;
     }
     
-    return success;
+    // Initialize components with error tolerance
+    bool wifiOk = wifiManager->initialize();
+    bool wsOk = webSocketClient->initialize();
+    
+    Serial.printf("[CommunicationManager] Component status: WiFi:%s WebSocket:%s\n",
+                 wifiOk ? "OK" : "FAIL", wsOk ? "OK" : "FAIL");
+    
+    // Mark as initialized even if some components failed
+    // Communication can work in degraded mode
+    initialized = true;
+    Serial.println("[CommunicationManager] Initialization complete (some components may have failed)");
+    
+    return true;  // Always return true to allow system to continue
 }
 
 void CommunicationManager::update() {

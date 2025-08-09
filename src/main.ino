@@ -19,6 +19,8 @@
 #include <EEPROM.h>
 #include "esp_heap_caps.h"
 #include "esp_core_dump.h"
+#include <ArduinoOTA.h>
+#include <WiFi.h>
 
 // Core modules
 #include "config.h"
@@ -318,6 +320,7 @@
     // Verify communication manager is initialized
     if (!commManager.isConnected() && !commManager.isWiFiConnected()) {
         Serial.println("[CommunicationTask] Warning: Communication not properly initialized");
+        Serial.println("[CommunicationTask] Will operate in local-only mode");
     }
     
     TickType_t lastWakeTime = xTaskGetTickCount();
@@ -325,36 +328,87 @@
     
     while (true) {
         // Check memory before operations
-        if (ESP.getFreeHeap() < 15000) {
-            Serial.println("[CommunicationTask] WARNING: Low memory, skipping update");
-            taskManager.delayMs(1000);
+        uint32_t freeHeap = ESP.getFreeHeap();
+        if (freeHeap < 15000) {
+            Serial.printf("[CommunicationTask] WARNING: Low memory (%u bytes), skipping update\n", freeHeap);
+            taskManager.delayMs(2000);  // Wait longer when low on memory
             continue;
         }
         
-        // Update communication components safely
+        // Update communication components safely with heap monitoring
+        uint32_t heapBefore = ESP.getFreeHeap();
         commManager.update();
+        uint32_t heapAfter = ESP.getFreeHeap();
+        
+        // Check for excessive memory usage
+        if (heapBefore > heapAfter && (heapBefore - heapAfter) > 1024) {
+            Serial.printf("[CommunicationTask] WARNING: Communication update used %u bytes\n", 
+                         heapBefore - heapAfter);
+        }
          
-         // Check for commands periodically
-         static unsigned long lastCommandCheck = 0;
-         if (millis() - lastCommandCheck >= UPDATE_INTERVAL_COMMANDS) {
-             CommandMessage command;
-             if (commManager.checkForCommands(command)) {
-                 // Send command to pump control task
-                 xQueueSend(taskManager.getCommandQueue(), &command, 0);
-             }
-             lastCommandCheck = millis();
-         }
-         
-         // Send status updates periodically
-         static unsigned long lastStatusUpdate = 0;
-         if (millis() - lastStatusUpdate >= UPDATE_INTERVAL_BACKEND) {
-             if (taskManager.takeMutex(taskManager.getSystemMutex(), pdMS_TO_TICKS(10))) {
-                 commManager.sendStatusUpdate(g_systemState, g_pumpStatus, 
-                                            g_groundTankData, g_roofTankData);
-                 taskManager.giveMutex(taskManager.getSystemMutex());
-             }
-             lastStatusUpdate = millis();
-         }
+                 // Check for commands periodically (only if sufficient memory)
+        static unsigned long lastCommandCheck = 0;
+        static int networkErrorCount = 0;
+        
+        if (millis() - lastCommandCheck >= UPDATE_INTERVAL_COMMANDS && 
+            ESP.getFreeHeap() > 20000 && networkErrorCount < 5) {
+            
+            uint32_t heapBeforeCmd = ESP.getFreeHeap();
+            CommandMessage command;
+            
+            if (commManager.checkForCommands(command)) {
+                // Send command to pump control task
+                xQueueSend(taskManager.getCommandQueue(), &command, 0);
+                networkErrorCount = 0;  // Reset error count on success
+            } else {
+                networkErrorCount++;
+            }
+            
+            uint32_t heapAfterCmd = ESP.getFreeHeap();
+            if (heapBeforeCmd > heapAfterCmd && (heapBeforeCmd - heapAfterCmd) > 512) {
+                Serial.printf("[CommunicationTask] Command check used %u bytes\n", 
+                             heapBeforeCmd - heapAfterCmd);
+            }
+            
+            lastCommandCheck = millis();
+        }
+        
+        // Send status updates periodically (only if sufficient memory)
+        static unsigned long lastStatusUpdate = 0;
+        if (millis() - lastStatusUpdate >= UPDATE_INTERVAL_BACKEND && 
+            ESP.getFreeHeap() > 25000 && networkErrorCount < 5) {
+            
+            if (taskManager.takeMutex(taskManager.getSystemMutex(), pdMS_TO_TICKS(10))) {
+                uint32_t heapBeforeStatus = ESP.getFreeHeap();
+                
+                bool statusSent = commManager.sendStatusUpdate(g_systemState, g_pumpStatus, 
+                                                             g_groundTankData, g_roofTankData);
+                if (!statusSent) {
+                    networkErrorCount++;
+                } else {
+                    networkErrorCount = 0;  // Reset on success
+                }
+                
+                uint32_t heapAfterStatus = ESP.getFreeHeap();
+                if (heapBeforeStatus > heapAfterStatus && (heapBeforeStatus - heapAfterStatus) > 512) {
+                    Serial.printf("[CommunicationTask] Status update used %u bytes\n", 
+                                 heapBeforeStatus - heapAfterStatus);
+                }
+                
+                taskManager.giveMutex(taskManager.getSystemMutex());
+            }
+            lastStatusUpdate = millis();
+        }
+        
+        // Disable network operations if too many errors
+        if (networkErrorCount >= 5) {
+            static unsigned long lastErrorReport = 0;
+            if (millis() - lastErrorReport >= 30000) {  // Report every 30 seconds
+                Serial.printf("[CommunicationTask] Network operations disabled due to errors (count: %d)\n", 
+                             networkErrorCount);
+                lastErrorReport = millis();
+            }
+        }
          
          taskManager.feedWatchdog();
          vTaskDelayUntil(&lastWakeTime, frequency);
@@ -630,15 +684,120 @@
  
  extern "C" void otaTask(void* parameters) {
     Serial.printf("[OTATask] Started on core %d\n", xPortGetCoreID());
-     
-     while (true) {
-         // OTA handling logic would go here
-         // This task sleeps most of the time and only activates during OTA
-         
-         taskManager.delayMs(1000);
-         taskManager.feedWatchdog();
-     }
- }
+    
+    // Wait for WiFi to be connected before starting OTA
+    while (!WiFi.isConnected()) {
+        taskManager.delayMs(1000);
+    }
+    
+    // Setup OTA
+    ArduinoOTA.setHostname("waterpump-esp32");
+    ArduinoOTA.setPassword("waterpump123");
+    
+    ArduinoOTA.onStart([]() {
+        String type;
+        if (ArduinoOTA.getCommand() == U_FLASH) {
+            type = "sketch";
+        } else { // U_SPIFFS
+            type = "filesystem";
+        }
+        
+        // Stop all tasks during OTA
+        Serial.println("[OTA] Update start: " + type);
+        
+        // Show OTA status on display
+        if (hardwareManager.getDisplay()) {
+            hardwareManager.getDisplay()->clearBuffer();
+            hardwareManager.getDisplay()->drawStr(10, 30, "OTA UPDATE");
+            hardwareManager.getDisplay()->drawStr(10, 45, "DO NOT POWER OFF!");
+            hardwareManager.getDisplay()->sendBuffer();
+        }
+    });
+    
+    ArduinoOTA.onEnd([]() {
+        Serial.println("[OTA] Update complete");
+        if (hardwareManager.getDisplay()) {
+            hardwareManager.getDisplay()->clearBuffer();
+            hardwareManager.getDisplay()->drawStr(10, 30, "OTA COMPLETE");
+            hardwareManager.getDisplay()->drawStr(10, 45, "RESTARTING...");
+            hardwareManager.getDisplay()->sendBuffer();
+        }
+    });
+    
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        unsigned int percent = (progress / (total / 100));
+        Serial.printf("[OTA] Progress: %u%%\n", percent);
+        
+        // Update display with progress
+        if (hardwareManager.getDisplay()) {
+            hardwareManager.getDisplay()->clearBuffer();
+            hardwareManager.getDisplay()->drawStr(10, 20, "OTA UPDATE");
+            
+            char progressStr[32];
+            snprintf(progressStr, sizeof(progressStr), "Progress: %u%%", percent);
+            hardwareManager.getDisplay()->drawStr(10, 35, progressStr);
+            
+            // Draw progress bar
+            int barWidth = (percent * 100) / 100;  // 100px wide bar
+            if (barWidth > 100) barWidth = 100;
+            hardwareManager.getDisplay()->drawBox(10, 45, barWidth, 8);
+            hardwareManager.getDisplay()->drawFrame(10, 45, 100, 8);
+            
+            hardwareManager.getDisplay()->sendBuffer();
+        }
+        
+        // Send progress via WebSocket if available
+        commManager.sendOTAProgress(percent, "Updating firmware");
+    });
+    
+    ArduinoOTA.onError([](ota_error_t error) {
+        Serial.printf("[OTA] Error[%u]: ", error);
+        String errorMsg = "";
+        if (error == OTA_AUTH_ERROR) {
+            errorMsg = "Auth Failed";
+            Serial.println("Auth Failed");
+        } else if (error == OTA_BEGIN_ERROR) {
+            errorMsg = "Begin Failed";
+            Serial.println("Begin Failed");
+        } else if (error == OTA_CONNECT_ERROR) {
+            errorMsg = "Connect Failed";
+            Serial.println("Connect Failed");
+        } else if (error == OTA_RECEIVE_ERROR) {
+            errorMsg = "Receive Failed";
+            Serial.println("Receive Failed");
+        } else if (error == OTA_END_ERROR) {
+            errorMsg = "End Failed";
+            Serial.println("End Failed");
+        }
+        
+        // Show error on display
+        if (hardwareManager.getDisplay()) {
+            hardwareManager.getDisplay()->clearBuffer();
+            hardwareManager.getDisplay()->drawStr(10, 20, "OTA ERROR");
+            hardwareManager.getDisplay()->drawStr(10, 35, errorMsg.c_str());
+            hardwareManager.getDisplay()->drawStr(10, 50, "Will retry...");
+            hardwareManager.getDisplay()->sendBuffer();
+        }
+        
+        // Send error via WebSocket
+        commManager.sendOTAComplete(false, FIRMWARE_VERSION, errorMsg);
+    });
+    
+    ArduinoOTA.begin();
+    Serial.println("[OTA] OTA server started");
+    Serial.printf("[OTA] Hostname: %s\n", ArduinoOTA.getHostname().c_str());
+    Serial.printf("[OTA] IP Address: %s\n", WiFi.localIP().toString().c_str());
+    
+    while (true) {
+        // Handle OTA updates
+        if (WiFi.isConnected()) {
+            ArduinoOTA.handle();
+        }
+        
+        taskManager.delayMs(100);  // Check more frequently for OTA
+        taskManager.feedWatchdog();
+    }
+}
  
  extern "C" void systemMonitorTask(void* parameters) {
     Serial.printf("[SystemMonitorTask] Started on core %d\n", xPortGetCoreID());
