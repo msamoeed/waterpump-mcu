@@ -395,15 +395,15 @@ String otaStatus = "";
 bool otaUpdateAvailable = false;
 
 // ========================================
-// ENCODER INTERRUPT (REDUCED SENSITIVITY)
+// ENCODER INTERRUPT (OPTIMIZED)
 // ========================================
 volatile unsigned long lastEncoderInterrupt = 0;
-const unsigned long ENCODER_DEBOUNCE_DELAY = 5; // 5ms debounce for reduced sensitivity
+const unsigned long ENCODER_DEBOUNCE_DELAY = 1; // 1ms debounce for interrupts
 
 void IRAM_ATTR updateEncoder() {
   unsigned long currentTime = millis();
   
-  // Increased debounce for reduced sensitivity
+  // Simple debounce for interrupt
   if (currentTime - lastEncoderInterrupt < ENCODER_DEBOUNCE_DELAY) {
     return;
   }
@@ -686,6 +686,10 @@ void startTargetPumpOperation(float targetInches, const char* description) {
   sprintf(reason, "Target mode: %s", description);
   setPumpState(true, reason);
   
+  // Immediate Redis sync for target mode activation
+  Serial.println("Target mode activated - syncing immediately with Redis");
+  sendMotorHeartbeat();
+  
   char message[30];
   sprintf(message, "TARGET: %s", description);
   showMessageWithAutoReturn(message);
@@ -889,7 +893,7 @@ void setPumpState(bool newState, const char* reason) {
     }
     
     sendPumpEventToBackend(newState ? "pump_start" : "pump_stop", reason);
-   forceDisplayUpdate = true;
+    forceDisplayUpdate = true;
     
     // Track manual commands to prevent auto override
     if (strstr(reason, "API command") != NULL || 
@@ -898,6 +902,13 @@ void setPumpState(bool newState, const char* reason) {
         strstr(reason, "Motor command") != NULL) {
       lastManualCommandTime = millis();
       Serial.println("Manual command detected - setting override timer");
+    }
+    
+    // Immediate Redis sync for manual encoder control to prevent state conflicts
+    if (strstr(reason, "Manual control") != NULL) {
+      Serial.println("Manual encoder control detected - syncing immediately with Redis");
+      // Send immediate heartbeat to update Redis with current state
+      sendMotorHeartbeat();
     }
     
     Serial.println("Pump state change completed");
@@ -1024,15 +1035,10 @@ void checkEncoderNanoStyle() {
   if (encoderPos != lastEncoderPos) {
     int delta = encoderPos - lastEncoderPos;
     
-    // Reduced sensitivity - require more movement for action
-    if (abs(delta) >= 3) {  // Changed from 1 to 3 for less sensitivity
+    // More sensitive step detection - respond to any movement
+    if (abs(delta) >= 1) {
       encoderWorking = true;
-      int singleSteps = delta / 3;  // Divide by 3 to further reduce sensitivity
-      
-      // Ensure at least one step if there's significant movement
-      if (singleSteps == 0 && abs(delta) >= 3) {
-        singleSteps = (delta > 0 ? 1 : -1);
-      }
+      int singleSteps = (abs(delta) >= 2) ? delta / 2 : (delta > 0 ? 1 : -1);
       
       if (currentView == -1) {
         selectedMode = (selectedMode + singleSteps + TOTAL_MODES) % TOTAL_MODES;
@@ -1069,7 +1075,6 @@ void checkEncoderNanoStyle() {
         forceDisplayUpdate = true;
       }
       
-      // Update lastEncoderPos to the processed position to prevent accumulation
       lastEncoderPos = encoderPos;
     }
   }
@@ -1130,12 +1135,18 @@ void handleButtonPress() {
             setPumpState(false, "Switched to auto mode");
           }
           showMessageWithAutoReturn("AUTO MODE ENABLED");
+          // Immediate Redis sync for encoder mode change
+          Serial.println("Encoder mode change to AUTO - syncing immediately with Redis");
+          sendMotorHeartbeat();
           pumpMenuLevel = PUMP_STATUS_VIEW;
           currentView = -1;
         } else if (pumpMenuSelection == 1) {
           // Manual Mode selected
           autoControlEnabled = false;
           manualPumpControl = true;
+          // Immediate Redis sync for encoder mode change
+          Serial.println("Encoder mode change to MANUAL - syncing immediately with Redis");
+          sendMotorHeartbeat();
           pumpMenuLevel = PUMP_MANUAL_CONTROL;
           pumpMenuSelection = 0;
           forceDisplayUpdate = true;
