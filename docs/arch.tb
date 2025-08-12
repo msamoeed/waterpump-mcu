@@ -1,0 +1,36 @@
+graph TB
+    subgraph "ESP32 Dual Core Architecture"
+        subgraph "CORE 1 (Real-time)"
+            CT["CriticalTask<br/>Priority: 4<br/>Frequency: 10ms<br/>📍 Pump Safety<br/>📍 Radio Communication<br/>📍 Input Handling<br/>📍 Audio Feedback"]
+            MT["MonitoringTask<br/>Priority: 3<br/>Frequency: 100ms<br/>📍 Sensor Monitoring<br/>📍 RGB Status<br/>📍 Connection Timeouts<br/>📍 Power Consumption"]
+        end
+        
+        subgraph "CORE 0 (Background)"
+            DT["DisplayTask<br/>Priority: 2<br/>Frequency: 50ms<br/>📍 OLED Updates<br/>📍 Menu Rendering<br/>📍 Message Display"]
+            NT["NetworkTask<br/>Priority: 1<br/>Frequency: 1000ms<br/>📍 Backend Communication<br/>📍 WebSocket Events<br/>📍 Motor Commands<br/>📍 OTA Updates<br/>📍 EEPROM Saves"]
+            ML["Main Loop<br/>📍 Arduino Core Maintenance<br/>📍 Minimal CPU Usage"]
+        end
+    end
+    
+    subgraph "Synchronization"
+        PSM["pumpStateMutex<br/>🔒 Pump Control"]
+        SDM["sensorDataMutex<br/>🔒 Sensor Data"]
+        DM["displayMutex<br/>🔒 Display Updates"]
+        NM["networkMutex<br/>🔒 Network Operations"]
+    end
+    
+    CT --> PSM
+    MT --> SDM
+    DT --> DM
+    NT --> NM
+    NT --> PSM
+    
+    style CT fill:#ff9999
+    style MT fill:#ffcc99
+    style DT fill:#99ccff
+    style NT fill:#99ff99
+    style ML fill:#ffff99
+    style PSM fill:#ffcccc
+    style SDM fill:#ccffcc
+    style DM fill:#ccccff
+    style NM fill:#ffffcc

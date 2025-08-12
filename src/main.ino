@@ -45,6 +45,9 @@
 #include <WebServer.h>
 #include <ESPAsyncWebServer.h>
 #include <WebSocketsClient.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 // ========================================
 // CONFIGURATION
@@ -211,6 +214,37 @@ struct PersistentSystemState {
 };
 
 // ========================================
+// FREERTOS TASK HANDLES AND SYNCHRONIZATION
+// ========================================
+// Task handles
+TaskHandle_t criticalTaskHandle = NULL;
+TaskHandle_t displayTaskHandle = NULL;
+TaskHandle_t networkTaskHandle = NULL;
+TaskHandle_t monitoringTaskHandle = NULL;
+
+// Synchronization primitives
+SemaphoreHandle_t pumpStateMutex;
+SemaphoreHandle_t displayMutex;
+SemaphoreHandle_t networkMutex;
+SemaphoreHandle_t sensorDataMutex;
+
+// Task timing constants
+#define CRITICAL_TASK_FREQUENCY_MS    10    // High-priority safety and pump control
+#define DISPLAY_TASK_FREQUENCY_MS     50    // Display updates
+#define NETWORK_TASK_FREQUENCY_MS     1000  // Backend communication
+#define MONITORING_TASK_FREQUENCY_MS  100   // Sensor monitoring and RGB
+
+// Core assignments
+#define CORE_0  0  // Background tasks (display, network)
+#define CORE_1  1  // Critical tasks (pump safety, radio)
+
+// Task priorities (higher number = higher priority)
+#define PRIORITY_CRITICAL   4
+#define PRIORITY_MONITORING 3
+#define PRIORITY_DISPLAY    2
+#define PRIORITY_NETWORK    1
+
+// ========================================
 // GLOBAL VARIABLES
 // ========================================
 WaterLevelData groundTankData, roofTankData;
@@ -330,22 +364,22 @@ bool returnToMenuAfterMessage = false;
 // Backend communication
 bool needsBackendUpdate = false;
 unsigned long lastBackendUpdate = 0;
-const unsigned long BACKEND_UPDATE_INTERVAL = 30000;
+const unsigned long BACKEND_UPDATE_INTERVAL = 15000;  // Reduced from 30 seconds to 15
 bool backendConnected = false;
 unsigned long lastBackendResponse = 0;
 int backendErrorCount = 0;
 
 // Command checking variables
 unsigned long lastCommandCheck = 0;
-const unsigned long COMMAND_CHECK_INTERVAL = 5000;  // Check every 5 seconds
+const unsigned long COMMAND_CHECK_INTERVAL = 2000;  // Check every 2 seconds (reduced from 5)
 unsigned long lastManualCommandTime = 0;
 const unsigned long MANUAL_COMMAND_OVERRIDE_DURATION = 30000;  // 30 seconds override
 
 // Centralized motor control variables
 unsigned long lastMotorHeartbeat = 0;
-const unsigned long MOTOR_HEARTBEAT_INTERVAL = 15000;  // Send heartbeat every 15 seconds
+const unsigned long MOTOR_HEARTBEAT_INTERVAL = 8000;  // Send heartbeat every 8 seconds (reduced from 15)
 unsigned long lastMotorStateSync = 0;
-const unsigned long MOTOR_STATE_SYNC_INTERVAL = 60000;  // Sync state every minute
+const unsigned long MOTOR_STATE_SYNC_INTERVAL = 30000;  // Sync state every 30 seconds (reduced from 60)
 bool motorStateInitialized = false;
 
 // ========================================
@@ -361,9 +395,19 @@ String otaStatus = "";
 bool otaUpdateAvailable = false;
 
 // ========================================
-// ENCODER INTERRUPT
+// ENCODER INTERRUPT (REDUCED SENSITIVITY)
 // ========================================
+volatile unsigned long lastEncoderInterrupt = 0;
+const unsigned long ENCODER_DEBOUNCE_DELAY = 5; // 5ms debounce for reduced sensitivity
+
 void IRAM_ATTR updateEncoder() {
+  unsigned long currentTime = millis();
+  
+  // Increased debounce for reduced sensitivity
+  if (currentTime - lastEncoderInterrupt < ENCODER_DEBOUNCE_DELAY) {
+    return;
+  }
+  
   bool clkState = digitalRead(ENCODER_CLK);
   bool dtState = digitalRead(ENCODER_DT);
   
@@ -374,6 +418,7 @@ void IRAM_ATTR updateEncoder() {
       encoderPos--;
     }
     lastClkState = clkState;
+    lastEncoderInterrupt = currentTime;
   }
 }
 
@@ -775,6 +820,12 @@ void checkPumpProtection() {
 }
 
 void setPumpState(bool newState, const char* reason) {
+  // Take mutex for thread-safe pump state changes
+  if (xSemaphoreTake(pumpStateMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    Serial.println("Failed to take pump state mutex");
+    return;
+  }
+  
   Serial.print("setPumpState called - newState: ");
   Serial.print(newState ? "TRUE" : "FALSE");
   Serial.print(", current pumpState: ");
@@ -784,6 +835,7 @@ void setPumpState(bool newState, const char* reason) {
   
   if (pumpStatus.protectionActive && newState) {
     Serial.println("Pump start blocked by protection system");
+    xSemaphoreGive(pumpStateMutex);
     return;
   }
   
@@ -842,7 +894,8 @@ void setPumpState(bool newState, const char* reason) {
     // Track manual commands to prevent auto override
     if (strstr(reason, "API command") != NULL || 
         strstr(reason, "Manual") != NULL ||
-        strstr(reason, "mobile app") != NULL) {
+        strstr(reason, "mobile app") != NULL ||
+        strstr(reason, "Motor command") != NULL) {
       lastManualCommandTime = millis();
       Serial.println("Manual command detected - setting override timer");
     }
@@ -851,6 +904,9 @@ void setPumpState(bool newState, const char* reason) {
   } else {
     Serial.println("No pump state change needed - already in requested state");
   }
+  
+  // Always release the mutex
+  xSemaphoreGive(pumpStateMutex);
 }
 
 void resetDailyUsage() {
@@ -968,9 +1024,15 @@ void checkEncoderNanoStyle() {
   if (encoderPos != lastEncoderPos) {
     int delta = encoderPos - lastEncoderPos;
     
-    if (abs(delta) >= 2) {
+    // Reduced sensitivity - require more movement for action
+    if (abs(delta) >= 3) {  // Changed from 1 to 3 for less sensitivity
       encoderWorking = true;
-      int singleSteps = delta / 2;
+      int singleSteps = delta / 3;  // Divide by 3 to further reduce sensitivity
+      
+      // Ensure at least one step if there's significant movement
+      if (singleSteps == 0 && abs(delta) >= 3) {
+        singleSteps = (delta > 0 ? 1 : -1);
+      }
       
       if (currentView == -1) {
         selectedMode = (selectedMode + singleSteps + TOTAL_MODES) % TOTAL_MODES;
@@ -1007,6 +1069,7 @@ void checkEncoderNanoStyle() {
         forceDisplayUpdate = true;
       }
       
+      // Update lastEncoderPos to the processed position to prevent accumulation
       lastEncoderPos = encoderPos;
     }
   }
@@ -1147,6 +1210,11 @@ void handleButtonPress() {
     } else {
       showMessageWithAutoReturn("BUZZER MUTED");
     }
+    currentView = -1;
+  } else if (currentView == 7) {
+    // System info - print task diagnostics to Serial
+    printTaskInfo();
+    showMessageWithAutoReturn("TASK INFO PRINTED");
     currentView = -1;
   } else {
     currentView = -1;
@@ -1822,23 +1890,27 @@ void handleRadioReceive() {
         WaterLevelData tempData;
         radio.read(&tempData, sizeof(tempData));
         
-        if (tempData.tankID == 1) {
-          groundTankData = tempData;
-          groundTankConnected = true;
-          lastGroundTankTime = currentTime;
-          groundSensorWorking = (tempData.levelInches > 0.1 || tempData.levelPercent > 0.1);
-          supplyFromGroundTank = tempData.waterSupplyOn;
-          groundAlarmActive = tempData.alarmActive;
-        } else if (tempData.tankID == 2) {
-          roofTankData = tempData;
-          roofTankConnected = true;
-          lastRoofTankTime = currentTime;
-          roofSensorWorking = (tempData.levelInches > 0.1 || tempData.levelPercent > 0.1);
-          supplyFromRoofTank = tempData.waterSupplyOn;
-          roofAlarmActive = tempData.alarmActive;
+        // Take mutex for thread-safe sensor data updates
+        if (xSemaphoreTake(sensorDataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          if (tempData.tankID == 1) {
+            groundTankData = tempData;
+            groundTankConnected = true;
+            lastGroundTankTime = currentTime;
+            groundSensorWorking = (tempData.levelInches > 0.1 || tempData.levelPercent > 0.1);
+            supplyFromGroundTank = tempData.waterSupplyOn;
+            groundAlarmActive = tempData.alarmActive;
+          } else if (tempData.tankID == 2) {
+            roofTankData = tempData;
+            roofTankConnected = true;
+            lastRoofTankTime = currentTime;
+            roofSensorWorking = (tempData.levelInches > 0.1 || tempData.levelPercent > 0.1);
+            supplyFromRoofTank = tempData.waterSupplyOn;
+            roofAlarmActive = tempData.alarmActive;
+          }
+          
+          waterSupplyOn = supplyFromGroundTank || supplyFromRoofTank;
+          xSemaphoreGive(sensorDataMutex);
         }
-        
-        waterSupplyOn = supplyFromGroundTank || supplyFromRoofTank;
       }
     }
   }
@@ -1864,7 +1936,13 @@ void checkConnectionTimeouts() {
 }
 
 void handleAutoPumpControl() {
-  // Check if we're in manual command override period
+  // Check if we're in manual mode (persistent setting, not just temporary override)
+  if (!autoControlEnabled) {
+    Serial.println("Auto control disabled - manual mode active");
+    return;
+  }
+  
+  // Check if we're in temporary manual command override period
   unsigned long currentTime = millis();
   bool inManualOverride = (currentTime - lastManualCommandTime) < MANUAL_COMMAND_OVERRIDE_DURATION;
   
@@ -1979,6 +2057,155 @@ void updateBackendVariablesBackground() {
 }
 
 // ========================================
+// FREERTOS TASK FUNCTIONS
+// ========================================
+
+// CORE 1: Critical Task - Pump Safety, Radio Communication, Input Handling
+void criticalTask(void *parameter) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  
+  while (true) {
+    // Take mutex for pump state operations
+    if (xSemaphoreTake(pumpStateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+      // High-priority pump safety checks
+      updateCurrentReading();
+      checkPumpProtection();
+      
+      // Handle power recovery (critical for safety)
+      handlePowerRecovery();
+      
+      // Auto pump control (safety-critical decisions)
+      handleAutoPumpControl();
+      
+      xSemaphoreGive(pumpStateMutex);
+    }
+    
+    // Radio communication (time-sensitive)
+    handleRadioReceive();
+    
+    // Input handling (needs to be responsive)
+    checkEncoderNanoStyle();
+    checkButtonWithDebounce();
+    
+    // Audio handling (immediate feedback)
+    handleNonBlockingAudio();
+    
+    // Yield to other tasks
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(CRITICAL_TASK_FREQUENCY_MS));
+  }
+}
+
+// CORE 1: Monitoring Task - Sensor Data, RGB, Timeouts
+void monitoringTask(void *parameter) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  
+  while (true) {
+    // Take mutex for sensor data
+    if (xSemaphoreTake(sensorDataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      // Connection timeouts
+      checkConnectionTimeouts();
+      
+      // Power consumption monitoring
+      updatePowerConsumption();
+      
+      xSemaphoreGive(sensorDataMutex);
+    }
+    
+    // RGB status updates (visual feedback)
+    updateRGBStatus();
+    handleRGBStateMachine();
+    
+    // Yield to other tasks
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(MONITORING_TASK_FREQUENCY_MS));
+  }
+}
+
+// CORE 0: Display Task - Screen Updates
+void displayTask(void *parameter) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  
+  while (true) {
+    // Take mutex for display operations
+    if (xSemaphoreTake(displayMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      // Update display
+      updateDisplayAlways();
+      
+      xSemaphoreGive(displayMutex);
+    }
+    
+    // Yield to other tasks
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(DISPLAY_TASK_FREQUENCY_MS));
+  }
+}
+
+// CORE 0: Network Task - Backend Communication, WebSocket, Commands
+void networkTask(void *parameter) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  
+  while (true) {
+    // Take mutex for network operations
+    if (xSemaphoreTake(networkMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      // Backend status updates
+      updateBackendVariablesBackground();
+      
+      // Centralized motor control system
+      if (motorStateInitialized) {
+        unsigned long currentTime = millis();
+        
+        // Send motor heartbeat periodically
+        if (currentTime - lastMotorHeartbeat >= MOTOR_HEARTBEAT_INTERVAL) {
+          sendMotorHeartbeat();
+          lastMotorHeartbeat = currentTime;
+        }
+        
+        // Sync motor state periodically
+        if (currentTime - lastMotorStateSync >= MOTOR_STATE_SYNC_INTERVAL) {
+          syncMotorStateWithBackend();
+          lastMotorStateSync = currentTime;
+        }
+        
+        // Check for motor commands
+        checkForMotorCommands();
+      }
+      
+      xSemaphoreGive(networkMutex);
+    }
+    
+    // Handle WebSocket events (non-blocking)
+    webSocket.loop();
+    
+    // Handle OTA updates
+    if (otaUpdateAvailable && !otaUpdateInProgress) {
+      static unsigned long otaAutoStartTime = 0;
+      if (otaAutoStartTime == 0) {
+        otaAutoStartTime = millis();
+      } else if (millis() - otaAutoStartTime > 10000) { // 10 second delay
+        startOTAUpdate();
+        otaAutoStartTime = 0;
+      }
+    }
+    
+    // Periodic EEPROM saves during active operations
+    unsigned long currentTime = millis();
+    if (currentTime - lastEEPROMSave > EEPROM_SAVE_INTERVAL) {
+      if (xSemaphoreTake(pumpStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        if (targetModeActive || pumpState) {
+          saveSystemStateToEEPROM();
+          
+          if (targetModeActive) {
+            saveTargetStateToEEPROM(false);
+          }
+        }
+        xSemaphoreGive(pumpStateMutex);
+      }
+    }
+    
+    // Yield to other tasks
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(NETWORK_TASK_FREQUENCY_MS));
+  }
+}
+
+// ========================================
 // SETUP FUNCTION
 // ========================================
 void setup() {
@@ -2085,100 +2312,161 @@ void setup() {
   
   // Initial motor state sync after everything is ready
   Serial.println("Performing initial motor state sync...");
-  delay(2000); // Wait for systems to stabilize
+  delay(1000); // Reduced wait time for systems to stabilize
   syncMotorStateWithBackend();
   motorStateInitialized = true;
   
-  Serial.println("Setup complete - Centralized motor control ready!");
+  // ========================================
+  // FREERTOS TASK INITIALIZATION
+  // ========================================
+  Serial.println("Initializing FreeRTOS tasks and synchronization...");
+  
+  // Create mutexes for thread-safe operations
+  pumpStateMutex = xSemaphoreCreateMutex();
+  displayMutex = xSemaphoreCreateMutex();
+  networkMutex = xSemaphoreCreateMutex();
+  sensorDataMutex = xSemaphoreCreateMutex();
+  
+  if (pumpStateMutex == NULL || displayMutex == NULL || 
+      networkMutex == NULL || sensorDataMutex == NULL) {
+    Serial.println("ERROR: Failed to create mutexes!");
+    ESP.restart();
+  }
+  
+  // Create tasks pinned to specific cores
+  
+  // CORE 1: Critical and monitoring tasks (real-time operations)
+  xTaskCreatePinnedToCore(
+    criticalTask,           // Task function
+    "CriticalTask",         // Name
+    4096,                   // Stack size
+    NULL,                   // Parameters
+    PRIORITY_CRITICAL,      // Priority
+    &criticalTaskHandle,    // Task handle
+    CORE_1                  // Core ID
+  );
+  
+  xTaskCreatePinnedToCore(
+    monitoringTask,         // Task function
+    "MonitoringTask",       // Name
+    3072,                   // Stack size
+    NULL,                   // Parameters
+    PRIORITY_MONITORING,    // Priority
+    &monitoringTaskHandle,  // Task handle
+    CORE_1                  // Core ID
+  );
+  
+  // CORE 0: Background tasks (non-critical operations)
+  xTaskCreatePinnedToCore(
+    displayTask,            // Task function
+    "DisplayTask",          // Name
+    4096,                   // Stack size
+    NULL,                   // Parameters
+    PRIORITY_DISPLAY,       // Priority
+    &displayTaskHandle,     // Task handle
+    CORE_0                  // Core ID
+  );
+  
+  xTaskCreatePinnedToCore(
+    networkTask,            // Task function
+    "NetworkTask",          // Name
+    8192,                   // Stack size (larger for network operations)
+    NULL,                   // Parameters
+    PRIORITY_NETWORK,       // Priority
+    &networkTaskHandle,     // Task handle
+    CORE_0                  // Core ID
+  );
+  
+  // Verify all tasks were created successfully
+  if (criticalTaskHandle == NULL || monitoringTaskHandle == NULL ||
+      displayTaskHandle == NULL || networkTaskHandle == NULL) {
+    Serial.println("ERROR: Failed to create one or more tasks!");
+    ESP.restart();
+  }
+  
+  Serial.println("FreeRTOS tasks created successfully:");
+  Serial.println("  - CriticalTask (Core 1, Priority 4): Pump safety, radio, input");
+  Serial.println("  - MonitoringTask (Core 1, Priority 3): Sensors, RGB, timeouts");
+  Serial.println("  - DisplayTask (Core 0, Priority 2): Screen updates");
+  Serial.println("  - NetworkTask (Core 0, Priority 1): Backend, WebSocket, commands");
+  
+  Serial.println("Setup complete - Multi-core pump control system ready!");
+  
+  // Print initial system information
+  printTaskInfo();
 }
 
 // ========================================
-// MAIN LOOP
+// TASK MONITORING AND DIAGNOSTICS
+// ========================================
+void printTaskInfo() {
+  Serial.println("\n=== FreeRTOS Task Information ===");
+  Serial.print("ESP32 has ");
+  Serial.print(ESP.getChipCores());
+  Serial.println(" cores");
+  Serial.print("Free heap: ");
+  Serial.print(ESP.getFreeHeap());
+  Serial.println(" bytes");
+  Serial.print("PSRAM free: ");
+  Serial.print(ESP.getFreePsram());
+  Serial.println(" bytes");
+  
+  // Task stack high water marks (lower is better - indicates unused stack)
+  if (criticalTaskHandle != NULL) {
+    Serial.print("CriticalTask stack free: ");
+    Serial.print(uxTaskGetStackHighWaterMark(criticalTaskHandle));
+    Serial.println(" words");
+  }
+  
+  if (monitoringTaskHandle != NULL) {
+    Serial.print("MonitoringTask stack free: ");
+    Serial.print(uxTaskGetStackHighWaterMark(monitoringTaskHandle));
+    Serial.println(" words");
+  }
+  
+  if (displayTaskHandle != NULL) {
+    Serial.print("DisplayTask stack free: ");
+    Serial.print(uxTaskGetStackHighWaterMark(displayTaskHandle));
+    Serial.println(" words");
+  }
+  
+  if (networkTaskHandle != NULL) {
+    Serial.print("NetworkTask stack free: ");
+    Serial.print(uxTaskGetStackHighWaterMark(networkTaskHandle));
+    Serial.println(" words");
+  }
+  
+  Serial.println("=== Task Distribution ===");
+  Serial.println("CORE 1 (Real-time): CriticalTask, MonitoringTask");
+  Serial.println("CORE 0 (Background): DisplayTask, NetworkTask, Main Loop");
+  Serial.println("=====================================\n");
+}
+
+// ========================================
+// MAIN LOOP (MINIMAL - MOST WORK DONE IN TASKS)
 // ========================================
 void loop() {
-  // Input handling
-  checkEncoderNanoStyle();
-  checkButtonWithDebounce();
-  updateDisplayAlways();
+  // The main loop is now minimal since critical operations are handled by tasks
+  // This preserves the Arduino framework structure while utilizing FreeRTOS tasks
   
-  // Handle power recovery
-  handlePowerRecovery();
+  // Only essential operations that must run in the main loop:
   
-  // System operations
-  updateRGBStatus();
-  handleRGBStateMachine();
-  handleRadioReceive();
-  handleNonBlockingAudio();
-  
-  // Integrated pump control
-  updateCurrentReading();
-  updatePowerConsumption();
-  checkPumpProtection();
-  
-  // System control and monitoring
-  checkConnectionTimeouts();
-  handleAutoPumpControl();
-  
-  // Background operations
-  updateBackendVariablesBackground();
-  
-  // Centralized motor control system
-  if (motorStateInitialized) {
-    // Send motor heartbeat periodically
-    unsigned long currentTime = millis();
-    if (currentTime - lastMotorHeartbeat >= MOTOR_HEARTBEAT_INTERVAL) {
-      sendMotorHeartbeat();
-      lastMotorHeartbeat = currentTime;
-    }
-    
-    // Sync motor state periodically
-    if (currentTime - lastMotorStateSync >= MOTOR_STATE_SYNC_INTERVAL) {
-      syncMotorStateWithBackend();
-      lastMotorStateSync = currentTime;
-    }
-    
-    // Check for motor commands
-    checkForMotorCommands();
-  }
-  
-  // Legacy pump commands (for backward compatibility)
-  // checkForPumpCommands();
-  
-  // Handle WebSocket events
-  webSocket.loop();
-  
-  // Handle OTA updates
-  if (otaUpdateAvailable && !otaUpdateInProgress) {
-    // Check if user wants to start OTA update (you can add a button or menu option)
-    // For now, we'll auto-start after a delay
-    static unsigned long otaAutoStartTime = 0;
-    if (otaAutoStartTime == 0) {
-      otaAutoStartTime = millis();
-    } else if (millis() - otaAutoStartTime > 10000) { // 10 second delay
-      startOTAUpdate();
-      otaAutoStartTime = 0;
-    }
-  }
-  
-  // Periodic EEPROM saves during active operations
-  unsigned long currentTime = millis();
-  if (currentTime - lastEEPROMSave > EEPROM_SAVE_INTERVAL) {
-    if (targetModeActive || pumpState) {
-      saveSystemStateToEEPROM();
-      
-      if (targetModeActive) {
-        saveTargetStateToEEPROM(false);
-      }
-    }
-  }
-  
+  // Arduino core maintenance
   yield();
+  
+  // Watchdog feed (if enabled)
+  // esp_task_wdt_reset();
+  
+  // Short delay to prevent excessive CPU usage
+  delay(1);
 }
 
 // ========================================
 // CENTRALIZED MOTOR CONTROL FUNCTIONS
 // ========================================
 void syncMotorStateWithBackend() {
+  Serial.println("=== REDIS-CENTRIC MOTOR STATE SYNC ===");
+  
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi not connected, skipping motor state sync");
     return;
@@ -2186,17 +2474,18 @@ void syncMotorStateWithBackend() {
   
   String url = String("http://") + BACKEND_HOST + ":" + BACKEND_PORT + API_BASE_URL + "/motor/state/" + DEVICE_ID;
   
-  Serial.print("Syncing motor state from: ");
+  Serial.print("Getting Redis state from: ");
   Serial.println(url);
   
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
+  http.setTimeout(3000); // 3 second timeout to prevent blocking
   
   int httpResponseCode = http.GET();
   
   if (httpResponseCode == 200) {
     String payload = http.getString();
-    Serial.print("Received motor state: ");
+    Serial.print("Received Redis motor state: ");
     Serial.println(payload);
     
     DynamicJsonDocument doc(1024);
@@ -2205,56 +2494,75 @@ void syncMotorStateWithBackend() {
     if (!error && doc["success"].as<bool>()) {
       JsonObject data = doc["data"];
       
-      // Sync local state with backend state
-      bool backendMotorRunning = data["motorRunning"] | false;
-      String backendControlMode = data["controlMode"] | "auto";
-      bool backendTargetActive = data["targetModeActive"] | false;
-      float backendTargetLevel = data["currentTargetLevel"] | 0.0;
-      String backendTargetDesc = data["targetDescription"] | "";
-      bool backendProtectionActive = data["protectionActive"] | false;
+      // Get Redis state (single source of truth)
+      bool redisMotorRunning = data["motorRunning"] | false;
+      String redisControlMode = data["controlMode"] | "auto";
+      bool redisTargetActive = data["targetModeActive"] | false;
+      float redisTargetLevel = data["currentTargetLevel"] | 0.0;
+      String redisTargetDesc = data["targetDescription"] | "";
+      bool redisProtectionActive = data["protectionActive"] | false;
       
-      Serial.print("Backend state - Motor: ");
-      Serial.print(backendMotorRunning ? "ON" : "OFF");
+      Serial.print("Redis state - Motor: ");
+      Serial.print(redisMotorRunning ? "ON" : "OFF");
       Serial.print(", Mode: ");
-      Serial.print(backendControlMode);
+      Serial.print(redisControlMode);
       Serial.print(", Target: ");
-      Serial.print(backendTargetActive ? "ACTIVE" : "INACTIVE");
+      Serial.print(redisTargetActive ? "ACTIVE" : "INACTIVE");
       Serial.print(", Protection: ");
-      Serial.println(backendProtectionActive ? "ACTIVE" : "INACTIVE");
+      Serial.println(redisProtectionActive ? "ACTIVE" : "INACTIVE");
       
-      // Update local state to match backend
-      autoControlEnabled = (backendControlMode == "auto");
-      manualPumpControl = (backendControlMode == "manual");
-      targetModeActive = backendTargetActive;
-      currentTargetLevel = backendTargetLevel;
-      targetDescription = backendTargetDesc;
-      pumpStatus.protectionActive = backendProtectionActive;
+      // REDIS IS SINGLE SOURCE OF TRUTH - Always sync to match
+      bool stateChanged = false;
       
-      // Only change pump state if there's a significant difference
-      if (pumpState != backendMotorRunning) {
-        Serial.print("Motor state mismatch - Local: ");
-        Serial.print(pumpState ? "ON" : "OFF");
-        Serial.print(", Backend: ");
-        Serial.println(backendMotorRunning ? "ON" : "OFF");
-        
-        // Update pump state to match backend
-        setPumpState(backendMotorRunning, "Backend state sync");
+      if (autoControlEnabled != (redisControlMode == "auto")) {
+        Serial.println("Control mode changed in Redis - syncing local state");
+        stateChanged = true;
       }
       
-      Serial.println("Motor state sync completed");
+      if (pumpState != redisMotorRunning) {
+        Serial.println("Motor state changed in Redis - syncing local state");
+        stateChanged = true;
+      }
+      
+      // Update ALL local state to match Redis (no local overrides)
+      autoControlEnabled = (redisControlMode == "auto");
+      manualPumpControl = (redisControlMode == "manual");
+      targetModeActive = redisTargetActive;
+      currentTargetLevel = redisTargetLevel;
+      targetDescription = redisTargetDesc;
+      pumpStatus.protectionActive = redisProtectionActive;
+      
+      // Sync pump hardware state to match Redis
+      if (pumpState != redisMotorRunning) {
+        setPumpState(redisMotorRunning, "Redis state sync");
+      }
+      
+      if (stateChanged) {
+        forceDisplayUpdate = true;
+        Serial.println("Local state synchronized with Redis");
+      }
+      
+      Serial.println("Redis motor state sync completed");
     } else {
       Serial.println("Failed to parse motor state response");
     }
   } else {
-    Serial.print("Failed to get motor state, HTTP code: ");
+    Serial.print("Failed to get Redis motor state, HTTP code: ");
     Serial.println(httpResponseCode);
+    if (httpResponseCode < 0) {
+      Serial.println("Network error - possibly timeout or connection failed");
+    }
   }
   
   http.end();
+  Serial.println("=== REDIS STATE SYNC COMPLETE ===");
 }
 
 void sendMotorHeartbeat() {
+  Serial.println("=== SENDING REDIS MOTOR HEARTBEAT ===");
+  
   if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected, skipping motor heartbeat");
     return;
   }
   
@@ -2276,20 +2584,35 @@ void sendMotorHeartbeat() {
   
   String url = String("http://") + BACKEND_HOST + ":" + BACKEND_PORT + API_BASE_URL + "/motor/heartbeat";
   
+  Serial.print("Updating Redis via heartbeat: ");
+  Serial.println(url);
+  Serial.print("MCU State: Motor=");
+  Serial.print(pumpState ? "ON" : "OFF");
+  Serial.print(", Mode=");
+  Serial.print(autoControlEnabled ? "AUTO" : "MANUAL");
+  Serial.print(", Protection=");
+  Serial.println(pumpStatus.protectionActive ? "ACTIVE" : "INACTIVE");
+  
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
+  http.setTimeout(3000); // 3 second timeout to prevent blocking
   
   int httpResponseCode = http.POST(jsonString);
   
   if (httpResponseCode > 0) {
-    Serial.print("Motor heartbeat sent, response: ");
+    String response = http.getString();
+    Serial.print("Redis heartbeat sent, response code: ");
     Serial.println(httpResponseCode);
+    if (httpResponseCode == 200) {
+      Serial.println("Redis motor state updated successfully");
+    }
   } else {
-    Serial.print("Motor heartbeat failed, error: ");
+    Serial.print("Redis heartbeat failed, error: ");
     Serial.println(httpResponseCode);
   }
   
   http.end();
+  Serial.println("=== REDIS HEARTBEAT COMPLETE ===");
 }
 
 String currentCommandId = "";
@@ -2306,6 +2629,7 @@ void checkForMotorCommands() {
       
       http.begin(url);
       http.addHeader("Content-Type", "application/json");
+      http.setTimeout(2000); // 2 second timeout for command checks
       
       int httpResponseCode = http.GET();
       
@@ -2403,16 +2727,20 @@ void processMotorCommand(const String& commandJson) {
     Serial.println("Executing AUTO command");
     autoControlEnabled = true;
     manualPumpControl = false;
+    lastManualCommandTime = millis(); // Track mode change
     if (targetModeActive) {
       setPumpState(false, "Motor command - switched to auto mode");
     }
     showMessageWithAutoReturn("AUTO MODE");
+    Serial.println("Mode changed to AUTO - will persist until explicitly changed");
     
   } else if (strcmp(action, "manual") == 0) {
     Serial.println("Executing MANUAL command");
     autoControlEnabled = false;
     manualPumpControl = true;
+    lastManualCommandTime = millis(); // Track mode change
     showMessageWithAutoReturn("MANUAL MODE");
+    Serial.println("Mode changed to MANUAL - will persist until explicitly changed");
     
   } else if (strcmp(action, "reset_protection") == 0) {
     Serial.println("Executing RESET_PROTECTION command");
@@ -2451,6 +2779,7 @@ void acknowledgeCommand(const String& commandId, bool success, const String& err
   
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
+  http.setTimeout(2000); // 2 second timeout for acknowledgments
   
   int httpResponseCode = http.POST(jsonString);
   
