@@ -348,7 +348,7 @@ bool returnToMenuAfterMessage = false;
 #define ROOF_TANK_UPPER_THRESHOLD 80.0
 
 // Timing constants
-#define TOTAL_MODES 8
+#define TOTAL_MODES 7  // Reduced from 8 since buzzer control is now centralized
 #define MENU_ITEMS_VISIBLE 5
 #define CONNECTION_TIMEOUT 15000
 #define DISPLAY_UPDATE_INTERVAL 50
@@ -1213,15 +1213,6 @@ void handleButtonPress() {
     resetDailyUsage();
     showMessageWithAutoReturn("USAGE RESET");
     currentView = -1;
-  } else if (currentView == 6) {
-    buzzerMuted = !buzzerMuted;
-    if (!buzzerMuted) {
-      playBeepNonBlocking(100);
-      showMessageWithAutoReturn("BUZZER ENABLED");
-    } else {
-      showMessageWithAutoReturn("BUZZER MUTED");
-    }
-    currentView = -1;
   } else if (currentView == 7) {
     // System info - print task diagnostics to Serial
     printTaskInfo();
@@ -1371,9 +1362,6 @@ void updateDisplayAlways() {
         displayPowerConsumption(); 
         break;
       case 6: 
-        displayBuzzerSettings(); 
-        break;
-      case 7: 
         displaySystemInfo(); 
         break;
     }
@@ -1398,8 +1386,7 @@ void displayMainMenu() {
     "4. Reset System",
     "5. Pump Control",
     "6. Power Usage",
-    "7. Buzzer Settings",
-    "8. System Info"
+    "7. System Info"
   };
   
   int startIdx = menuScrollOffset;
@@ -1733,28 +1720,7 @@ void displayPowerConsumption() {
   u8g2.sendBuffer();
 }
 
-void displayBuzzerSettings() {
-  u8g2.clearBuffer();
-  
-  u8g2.setFont(u8g2_font_7x14_tf);
-  u8g2.drawStr(15, 12, "BUZZER SETTINGS");
-  
-  u8g2.setFont(u8g2_font_6x12_tf);
-  u8g2.drawStr(5, 30, "Current Status:");
-  
-  if (buzzerMuted) {
-    u8g2.drawStr(25, 45, "MUTED");
-    u8g2.drawStr(5, 60, "Press: ENABLE & Exit");
-  } else {
-    u8g2.drawStr(25, 45, "ENABLED");
-    u8g2.drawStr(5, 60, "Press: MUTE & Exit");
-  }
-  
-  u8g2.setFont(u8g2_font_5x8_tf);
-  u8g2.drawStr(5, 78, "Press: Toggle & Return to Menu");
-  
-  u8g2.sendBuffer();
-}
+
 
 void displaySystemInfo() {
   u8g2.clearBuffer();
@@ -2512,6 +2478,7 @@ void syncMotorStateWithBackend() {
       float redisTargetLevel = data["currentTargetLevel"] | 0.0;
       String redisTargetDesc = data["targetDescription"] | "";
       bool redisProtectionActive = data["protectionActive"] | false;
+      bool redisBuzzerMuted = data["buzzerMuted"] | false; // NEW: Buzzer state from Redis
       
       Serial.print("Redis state - Motor: ");
       Serial.print(redisMotorRunning ? "ON" : "OFF");
@@ -2520,7 +2487,9 @@ void syncMotorStateWithBackend() {
       Serial.print(", Target: ");
       Serial.print(redisTargetActive ? "ACTIVE" : "INACTIVE");
       Serial.print(", Protection: ");
-      Serial.println(redisProtectionActive ? "ACTIVE" : "INACTIVE");
+      Serial.print(redisProtectionActive ? "ACTIVE" : "INACTIVE");
+      Serial.print(", Buzzer: ");
+      Serial.println(redisBuzzerMuted ? "MUTED" : "ENABLED");
       
       // REDIS IS SINGLE SOURCE OF TRUTH - Always sync to match
       bool stateChanged = false;
@@ -2535,6 +2504,11 @@ void syncMotorStateWithBackend() {
         stateChanged = true;
       }
       
+      if (buzzerMuted != redisBuzzerMuted) {
+        Serial.println("Buzzer state changed in Redis - syncing local state");
+        stateChanged = true;
+      }
+      
       // Update ALL local state to match Redis (no local overrides)
       autoControlEnabled = (redisControlMode == "auto");
       manualPumpControl = (redisControlMode == "manual");
@@ -2542,6 +2516,7 @@ void syncMotorStateWithBackend() {
       currentTargetLevel = redisTargetLevel;
       targetDescription = redisTargetDesc;
       pumpStatus.protectionActive = redisProtectionActive;
+      buzzerMuted = redisBuzzerMuted; // NEW: Sync buzzer state
       
       // Sync pump hardware state to match Redis
       if (pumpState != redisMotorRunning) {
@@ -2589,6 +2564,7 @@ void sendMotorHeartbeat() {
   doc["power_watts"] = pumpStatus.powerWatts;
   doc["runtime_minutes"] = pumpStatus.runTimeMinutes;
   doc["total_runtime_hours"] = pumpStatus.totalRunTimeHours;
+  doc["buzzer_muted"] = buzzerMuted; // NEW: Include buzzer state in heartbeat
   
   String jsonString;
   serializeJson(doc, jsonString);
@@ -2602,7 +2578,9 @@ void sendMotorHeartbeat() {
   Serial.print(", Mode=");
   Serial.print(autoControlEnabled ? "AUTO" : "MANUAL");
   Serial.print(", Protection=");
-  Serial.println(pumpStatus.protectionActive ? "ACTIVE" : "INACTIVE");
+  Serial.print(pumpStatus.protectionActive ? "ACTIVE" : "INACTIVE");
+  Serial.print(", Buzzer=");
+  Serial.println(buzzerMuted ? "MUTED" : "ENABLED");
   
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
@@ -2757,6 +2735,19 @@ void processMotorCommand(const String& commandJson) {
     Serial.println("Executing RESET_PROTECTION command");
     clearProtectionSystem();
     showMessageWithAutoReturn("PROTECTION RESET");
+    
+  } else if (strcmp(action, "enable_buzzer") == 0) {
+    Serial.println("Executing ENABLE_BUZZER command");
+    buzzerMuted = false;
+    showMessageWithAutoReturn("BUZZER ENABLED");
+    playBeepNonBlocking(100); // Test beep to confirm it's working
+    Serial.println("Buzzer enabled from mobile app");
+    
+  } else if (strcmp(action, "disable_buzzer") == 0) {
+    Serial.println("Executing DISABLE_BUZZER command");
+    buzzerMuted = true;
+    showMessageWithAutoReturn("BUZZER DISABLED");
+    Serial.println("Buzzer disabled from mobile app");
     
   } else {
     Serial.print("Unknown action: ");
